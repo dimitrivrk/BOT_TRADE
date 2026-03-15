@@ -206,10 +206,9 @@ class CryptoTradingEnv(gym.Env):
 
     def _compute_reward(self, position_change: float) -> float:
         """
-        Reward risk-aware v3 :
-        R = Profit - Costs - λ_cvar × CVaR - λ_dd × Drawdown + Holding Bonus
-
-        Basé sur le papier "Risk-Aware DRL for Crypto Trading" (2025)
+        Reward risk-aware v3.1 (rééquilibrée) :
+        Le signal principal est le PnL. Les pénalités sont des régulateurs légers,
+        pas le signal dominant. L'agent doit TRADER pour gagner de la reward.
         """
         if len(self.returns_history) < 2:
             return 0.0
@@ -217,7 +216,12 @@ class CryptoTradingEnv(gym.Env):
         R_t = self.returns_history[-1]
         reward = 0.0
 
-        # === 1. Differential Sharpe Ratio ===
+        # === 1. PnL — SIGNAL PRINCIPAL (doit dominer la reward) ===
+        # R_t est un log-return 1h (~0.001), on scale ×1000 pour que ce soit le signal dominant
+        pnl_reward = R_t * 1000.0
+        reward += float(np.clip(pnl_reward, -5.0, 5.0))
+
+        # === 2. Differential Sharpe Ratio (bonus, pas dominant) ===
         A_new = self.A_prev + self.eta * (R_t - self.A_prev)
         B_new = self.B_prev + self.eta * (R_t**2 - self.B_prev)
 
@@ -230,38 +234,37 @@ class CryptoTradingEnv(gym.Env):
         self.A_prev = A_new
         self.B_prev = B_new
 
-        reward += float(np.clip(dsr * 100, -5.0, 5.0))
+        reward += float(np.clip(dsr * 10, -2.0, 2.0))  # réduit de ×100 à ×10, clip ±2
 
-        # === 2. CVaR (Conditional Value at Risk) ===
-        # Pénalise le tail risk — les pires 5% des returns
+        # === 3. CVaR — pénalité LÉGÈRE sur le tail risk ===
         if len(self.returns_history) >= 20:
-            returns_arr = np.array(self.returns_history[-100:])  # fenêtre glissante
+            returns_arr = np.array(self.returns_history[-100:])
             var_threshold = np.percentile(returns_arr, self.cvar_alpha * 100)
             tail_returns = returns_arr[returns_arr <= var_threshold]
             if len(tail_returns) > 0:
                 cvar = np.mean(tail_returns)
-                # Pénalité proportionnelle au tail risk
-                reward += self.cvar_lambda * cvar * 50  # cvar est négatif → pénalité
+                # Pénalité douce : lambda × cvar × 5 (réduit de ×50 à ×5)
+                reward += self.cvar_lambda * cvar * 5
 
-        # === 3. Pénalité de turnover ===
-        turnover_penalty = -0.08 * position_change
+        # === 4. Pénalité de turnover (réduite) ===
+        turnover_penalty = -0.02 * position_change  # réduit de 0.08 à 0.02
         reward += turnover_penalty
 
-        # === 4. Pénalité de drawdown progressive ===
+        # === 5. Pénalité de drawdown (seuils relevés) ===
         if self.peak_balance > 0:
             dd = (self.balance - self.peak_balance) / self.peak_balance
-            if dd < -0.05:
-                reward += dd * 3.0
-            if dd < -0.15:
-                reward -= 2.0
+            if dd < -0.10:  # seuil relevé de -5% à -10%
+                reward += dd * 1.0  # réduit de 3.0 à 1.0
+            if dd < -0.20:  # seuil relevé de -15% à -20%
+                reward -= 1.0  # réduit de 2.0 à 1.0
 
-        # === 5. Holding bonus (réduit le churning) ===
+        # === 6. Holding bonus (encourage à garder les positions gagnantes) ===
         if self.time_in_position > 3 and R_t * self.position > 0:
-            # Bonus si on est en position depuis >3 steps et que le trade va dans le bon sens
-            reward += 0.1 * min(self.time_in_position / 20, 1.0)
+            reward += 0.15 * min(self.time_in_position / 20, 1.0)
 
-        # === 6. PnL brut (signal de base) ===
-        reward += R_t * 10.0
+        # === 7. Pénalité d'INACTION (nouveau — force l'agent à trader) ===
+        if abs(self.position) < 0.05:
+            reward -= 0.1  # petite pénalité constante pour rester flat
 
         return float(np.clip(reward, -10.0, 10.0))
 
@@ -548,6 +551,14 @@ class RLTradingAgent:
             self.models[algo_name] = model
             self.vec_envs[algo_name] = env
             logger.info(f"Agent {algo_name} entraîné et sauvegardé !")
+
+            # IMPORTANT : fermer les SubprocVecEnv pour libérer les process/locks
+            # Sinon le prochain agent ne peut pas créer de nouveaux SubprocVecEnv (pickle error)
+            try:
+                val_env.close()
+                env.close()
+            except Exception:
+                pass
 
         # Garder compatibilité avec l'interface single model
         if self.agent_names:

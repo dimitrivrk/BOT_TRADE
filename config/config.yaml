@@ -145,7 +145,7 @@ models:
       reward_type: "risk_aware"
       lookback: 20           # doit matcher le lookback du RL
       cvar_alpha: 0.05       # 5% tail risk pour CVaR
-      cvar_lambda: 0.5       # poids de la penalite CVaR
+      cvar_lambda: 0.2       # poids de la penalite CVaR (reduit de 0.5 → 0.2)
 
   # --- Feature Selection (XGBoost) ---
   feature_selection:
