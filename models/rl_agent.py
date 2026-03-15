@@ -410,7 +410,6 @@ class RLTradingAgent:
         self.agent_names = ensemble_cfg if isinstance(ensemble_cfg, list) else [ensemble_cfg]
 
         self.models = {}  # {"SAC": model, "PPO": model, "DDPG": model}
-        self.vec_envs = {}
         self.agent_weights = {name: 1.0 / len(self.agent_names) for name in self.agent_names}
 
         # Compatibilité avec l'ancienne interface (single model)
@@ -519,16 +518,17 @@ class RLTradingAgent:
             model.save(str(algo_ckpt / "final_model"))
 
             self.models[algo_name] = model
-            self.vec_envs[algo_name] = env
+            # NE PAS stocker env dans self — ça crée des thread locks
+            # qui empêchent le pickle lors de la création du prochain SubprocVecEnv
             logger.info(f"Agent {algo_name} entraîné et sauvegardé !")
 
-            # IMPORTANT : fermer les SubprocVecEnv pour libérer les process/locks
-            # Sinon le prochain agent ne peut pas créer de nouveaux SubprocVecEnv (pickle error)
+            # Fermer et supprimer les envs pour libérer les process/locks
             try:
                 val_env.close()
                 env.close()
             except Exception:
                 pass
+            del env, val_env
 
         # Garder compatibilité avec l'interface single model
         if self.agent_names:
