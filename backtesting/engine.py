@@ -137,13 +137,14 @@ class BacktestEngine:
         directions = []
         confidences = []
 
-        # Charger le TFT pour ce symbole
-        if self.ensemble.tft and self.ensemble.tft.model is None:
-            try:
-                self.ensemble.tft.load(symbol)
-                logger.info(f"TFT charge pour {symbol}")
-            except Exception as e:
-                logger.warning(f"TFT non disponible pour {symbol} : {e}")
+        # Charger le modèle de prédiction (Mamba ou TFT fallback)
+        if self.ensemble.mamba is not None and hasattr(self.ensemble.mamba, 'model'):
+            if self.ensemble.mamba.model is None:
+                try:
+                    self.ensemble.mamba.load(symbol)
+                    logger.info(f"Mamba/TFT chargé pour {symbol}")
+                except Exception as e:
+                    logger.warning(f"Mamba/TFT non disponible pour {symbol} : {e}")
 
         lookback = 100  # fenetre minimum pour les modeles
         total = len(features)
