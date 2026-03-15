@@ -9,7 +9,7 @@ ccxt[async]                  # pour le WebSocket async
 # --- Data Processing ---
 pandas>=2.1.0
 numpy>=1.26.0
-pandas-ta>=0.4.0             # indicateurs techniques
+# pandas-ta retiré — ADX implémenté en pur numpy/pandas (incompatible Python 3.11)
 pyarrow>=14.0.0              # format parquet pour la persistence
 
 # --- Deep Learning ---
