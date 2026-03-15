@@ -3,7 +3,7 @@
 # =============================================================================
 
 exchange:
-  name: "binance"          # binance | bybit | kraken | okx
+  name: "bybit"          # binance | bybit | kraken | okx
   sandbox: true            # true = testnet (IMPORTANT: mettre false en prod)
   rate_limit: true
   timeout: 30000
