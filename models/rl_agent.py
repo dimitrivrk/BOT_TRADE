@@ -624,6 +624,31 @@ class RLTradingAgent:
         else:
             raise ValueError(f"Algorithme inconnu : {algo_name}")
 
+    def _load_vec_normalizers(self, features_df, prices_df):
+        """Charge et cache les VecNormalize pour chaque agent (appelé une seule fois)."""
+        if hasattr(self, '_vec_norms') and self._vec_norms is not None:
+            return
+        self._vec_norms = {}
+        lookback = self.cfg.get("lookback", 20)
+        for algo_name in self.models:
+            vec_norm_path = self.checkpoint_dir / algo_name.lower() / "vec_normalize.pkl"
+            if vec_norm_path.exists():
+                try:
+                    dummy_env = DummyVecEnv([
+                        lambda: CryptoTradingEnv(
+                            features_df.tail(lookback + 10),
+                            prices_df.tail(lookback + 10),
+                            self.env_cfg, mode="inference"
+                        )
+                    ])
+                    vec_norm = VecNormalize.load(str(vec_norm_path), dummy_env)
+                    vec_norm.training = False
+                    vec_norm.norm_reward = False
+                    self._vec_norms[algo_name] = vec_norm
+                    logger.info(f"VecNormalize chargé pour {algo_name}")
+                except Exception as e:
+                    logger.warning(f"VecNormalize load failed pour {algo_name}: {e}")
+
     def predict(
         self,
         features_df: pd.DataFrame,
@@ -633,10 +658,10 @@ class RLTradingAgent:
         """
         Génère un signal de trading via ensemble vote.
 
-        Fix v3.3 :
-        - Charge VecNormalize pour normaliser les obs comme pendant le training
+        Fix v3.4 :
+        - Charge VecNormalize une seule fois (caché)
         - Construit l'observation directement (pas de simulation 80 steps)
-        - Chaque agent reçoit la MÊME observation normalisée
+        - Fix extraction scalaire depuis action array
         """
         # Charger les modèles si nécessaire
         if not self.models:
@@ -644,6 +669,9 @@ class RLTradingAgent:
 
         lookback = self.cfg.get("lookback", 20)
         n_extra = 4
+
+        # Charger VecNormalize une seule fois
+        self._load_vec_normalizers(features_df, prices_df)
 
         # Ajuster le nombre de features pour matcher le modèle
         if self.models:
@@ -663,7 +691,6 @@ class RLTradingAgent:
         flat = feat_window.flatten()
 
         # Features augmentées (valeurs neutres pour l'inférence ponctuelle)
-        # position=0, drawdown=0, vol=estimée, time_in_pos=0
         if len(prices_df) >= 20:
             recent_returns = np.diff(np.log(prices_df['close'].values[-21:].astype(np.float64)))
             recent_vol = float(np.std(recent_returns)) if len(recent_returns) > 1 else 0.0
@@ -684,29 +711,17 @@ class RLTradingAgent:
 
         for algo_name, model in self.models.items():
             try:
-                # Charger VecNormalize si disponible (CRITIQUE pour matching le training)
                 obs = raw_obs.copy()
-                vec_norm_path = self.checkpoint_dir / algo_name.lower() / "vec_normalize.pkl"
-                if vec_norm_path.exists():
-                    try:
-                        vec_norm = VecNormalize.load(str(vec_norm_path), DummyVecEnv([
-                            lambda: CryptoTradingEnv(
-                                features_df.tail(lookback + 10),
-                                prices_df.tail(lookback + 10),
-                                self.env_cfg, mode="inference"
-                            )
-                        ]))
-                        vec_norm.training = False
-                        vec_norm.norm_reward = False
-                        # Normaliser l'observation
-                        obs = vec_norm.normalize_obs(obs)
-                    except Exception as e:
-                        logger.warning(f"VecNormalize load failed pour {algo_name}: {e}")
 
-                # Prédire directement sur l'observation courante
-                obs_tensor = np.expand_dims(obs, 0) if obs.ndim == 1 else obs
-                action, _ = model.predict(obs_tensor, deterministic=deterministic)
-                position = float(np.clip(action[0], -1.0, 1.0))
+                # Normaliser via VecNormalize caché
+                if hasattr(self, '_vec_norms') and algo_name in self._vec_norms:
+                    obs = self._vec_norms[algo_name].normalize_obs(obs)
+
+                # Prédire — SB3 attend (1, obs_dim) et retourne (1, action_dim)
+                obs_2d = obs.reshape(1, -1)
+                action, _ = model.predict(obs_2d, deterministic=deterministic)
+                # Extraire le scalaire proprement
+                position = float(np.clip(action.flatten()[0], -1.0, 1.0))
                 agent_predictions[algo_name] = position
 
             except Exception as e:
