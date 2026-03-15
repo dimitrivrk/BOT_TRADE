@@ -1,11 +1,11 @@
 """
-Agent de Reinforcement Learning v2 pour le trading crypto.
-Améliorations vs v1 :
-  - SAC (Soft Actor-Critic) par défaut au lieu de PPO → plus stable, off-policy
-  - Differential Sharpe Ratio comme reward → signal plus lisse
-  - Pénalités : drawdown + turnover excessif + inactivité
-  - target_kl sur PPO en fallback
-  - Meilleure normalisation des observations
+Agent de Reinforcement Learning v3 pour le trading crypto.
+
+Architecture état de l'art 2025 :
+  - Ensemble de 3 agents : SAC + PPO + DDPG
+  - Reward risk-aware : Differential Sharpe + pénalité CVaR + drawdown
+  - Feature extractor SSM-inspired (State Space Model léger)
+  - Vote pondéré dynamique entre les 3 agents
 """
 
 import numpy as np
@@ -18,14 +18,14 @@ from pathlib import Path
 import yaml
 import pickle
 
-from stable_baselines3 import PPO, SAC
+from stable_baselines3 import PPO, SAC, DDPG
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
     EvalCallback, CheckpointCallback, BaseCallback
 )
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.noise import NormalActionNoise
+from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
 
 import torch.nn as nn
 from utils.logger import setup_logger
@@ -34,18 +34,18 @@ logger = setup_logger("models.rl_agent")
 
 
 # =============================================================================
-# ENVIRONNEMENT DE TRADING v2
+# ENVIRONNEMENT DE TRADING v3
 # =============================================================================
 
 class CryptoTradingEnv(gym.Env):
     """
-    Environnement Gym v2 pour le trading crypto.
+    Environnement Gym v3 pour le trading crypto.
 
-    Améliorations :
-    - Differential Sharpe Ratio (Moody & Saffell 1998)
-    - Pénalité de turnover (freine le churning)
-    - Pénalité drawdown progressive
-    - Bonus pour inactivité intelligente (flat quand incertain)
+    Améliorations v3 :
+    - CVaR (Conditional Value at Risk) dans la reward
+    - Reward = Profit - Costs - λ × CVaR (risk-aware)
+    - Holding bonus pour réduire le churning
+    - Observation enrichie avec position + drawdown + volatilité réalisée
     """
 
     metadata = {"render_modes": ["human"]}
@@ -63,21 +63,24 @@ class CryptoTradingEnv(gym.Env):
         self.returns = np.diff(np.log(self.prices))  # log returns
 
         self.n_features = self.features.shape[1]
-        self.lookback = config.get("lookback", 20)  # 20 au lieu de 50 → obs 1680 vs 4200
+        self.lookback = config.get("lookback", 20)
         self.mode = mode
 
         # Config
         self.initial_balance = config.get("initial_balance", 10000)
         self.transaction_cost = config.get("transaction_cost", 0.001)
-        self.reward_type = config.get("reward_type", "differential_sharpe")
+        self.reward_type = config.get("reward_type", "risk_aware")
+        self.cvar_alpha = config.get("cvar_alpha", 0.05)  # 5% tail risk
+        self.cvar_lambda = config.get("cvar_lambda", 0.5)  # poids de la pénalité CVaR
 
         # Differential Sharpe Ratio state (EMA)
-        self.eta = 0.01  # decay factor pour DSR
-        self.A_prev = 0.0  # EMA des returns
-        self.B_prev = 0.0  # EMA des returns^2
+        self.eta = 0.01
+        self.A_prev = 0.0
+        self.B_prev = 0.0
 
-        # Espaces Gym
-        obs_size = self.lookback * self.n_features
+        # Observation augmentée : features + [position, drawdown, volatilité réalisée, time_in_position]
+        n_extra = 4
+        obs_size = self.lookback * self.n_features + n_extra
         self.observation_space = spaces.Box(
             low=-5.0, high=5.0,
             shape=(obs_size,),
@@ -95,7 +98,7 @@ class CryptoTradingEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Randomiser le point de départ en mode train (meilleure exploration)
+        # Randomiser le point de départ en mode train
         if self.mode == "train" and len(self.prices) > self.lookback + 500:
             max_start = len(self.prices) - 500
             self.current_step = self.np_random.integers(self.lookback, max_start)
@@ -109,6 +112,8 @@ class CryptoTradingEnv(gym.Env):
         self.portfolio_values = [self.initial_balance]
         self.total_fees = 0.0
         self.peak_balance = self.initial_balance
+        self.time_in_position = 0
+        self.prev_action_dir = 0
 
         # Reset DSR state
         self.A_prev = 0.0
@@ -121,7 +126,19 @@ class CryptoTradingEnv(gym.Env):
         start = self.current_step - self.lookback
         obs = self.features[start:self.current_step]
         obs = np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
-        return obs.flatten().astype(np.float32)
+        flat = obs.flatten().astype(np.float32)
+
+        # Features augmentées
+        dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
+        recent_vol = np.std(self.returns_history[-20:]) if len(self.returns_history) >= 20 else 0.0
+        extras = np.array([
+            self.position,                              # position actuelle
+            np.clip(dd, -1.0, 0.0),                    # drawdown courant
+            np.clip(recent_vol * 100, 0.0, 5.0),       # volatilité réalisée
+            np.clip(self.time_in_position / 100, 0, 1), # temps dans la position
+        ], dtype=np.float32)
+
+        return np.concatenate([flat, extras])
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         new_position = float(np.clip(action[0], -1.0, 1.0))
@@ -144,6 +161,14 @@ class CryptoTradingEnv(gym.Env):
 
         # Track peak pour drawdown
         self.peak_balance = max(self.peak_balance, self.balance)
+
+        # Temps dans la même direction
+        current_dir = 1 if new_position > 0.1 else (-1 if new_position < -0.1 else 0)
+        if current_dir == self.prev_action_dir and current_dir != 0:
+            self.time_in_position += 1
+        else:
+            self.time_in_position = 0
+        self.prev_action_dir = current_dir
 
         # Update position
         self.position = new_position
@@ -181,19 +206,18 @@ class CryptoTradingEnv(gym.Env):
 
     def _compute_reward(self, position_change: float) -> float:
         """
-        Reward multi-composantes :
-        1. Differential Sharpe Ratio (signal principal)
-        2. Pénalité de turnover
-        3. Pénalité de drawdown progressive
+        Reward risk-aware v3 :
+        R = Profit - Costs - λ_cvar × CVaR - λ_dd × Drawdown + Holding Bonus
+
+        Basé sur le papier "Risk-Aware DRL for Crypto Trading" (2025)
         """
         if len(self.returns_history) < 2:
             return 0.0
 
-        R_t = self.returns_history[-1]  # return du step courant
+        R_t = self.returns_history[-1]
         reward = 0.0
 
-        # === 1. Differential Sharpe Ratio (Moody & Saffell) ===
-        # DSR = dSharpe/dt, mesure l'amélioration marginale du Sharpe
+        # === 1. Differential Sharpe Ratio ===
         A_new = self.A_prev + self.eta * (R_t - self.A_prev)
         B_new = self.B_prev + self.eta * (R_t**2 - self.B_prev)
 
@@ -201,28 +225,43 @@ class CryptoTradingEnv(gym.Env):
         if abs(denom) > 1e-10:
             dsr = (B_new * (R_t - A_new) - 0.5 * A_new * (R_t**2 - B_new)) / denom
         else:
-            dsr = R_t  # fallback au PnL simple
+            dsr = R_t
 
         self.A_prev = A_new
         self.B_prev = B_new
 
-        # Normaliser le DSR pour qu'il soit dans une plage raisonnable
         reward += float(np.clip(dsr * 100, -5.0, 5.0))
 
-        # === 2. Pénalité de turnover (freine le churning) ===
-        turnover_penalty = -0.1 * position_change
+        # === 2. CVaR (Conditional Value at Risk) ===
+        # Pénalise le tail risk — les pires 5% des returns
+        if len(self.returns_history) >= 20:
+            returns_arr = np.array(self.returns_history[-100:])  # fenêtre glissante
+            var_threshold = np.percentile(returns_arr, self.cvar_alpha * 100)
+            tail_returns = returns_arr[returns_arr <= var_threshold]
+            if len(tail_returns) > 0:
+                cvar = np.mean(tail_returns)
+                # Pénalité proportionnelle au tail risk
+                reward += self.cvar_lambda * cvar * 50  # cvar est négatif → pénalité
+
+        # === 3. Pénalité de turnover ===
+        turnover_penalty = -0.08 * position_change
         reward += turnover_penalty
 
-        # === 3. Pénalité de drawdown progressive ===
+        # === 4. Pénalité de drawdown progressive ===
         if self.peak_balance > 0:
             dd = (self.balance - self.peak_balance) / self.peak_balance
             if dd < -0.05:
-                reward += dd * 3.0  # pénalité proportionnelle au DD
+                reward += dd * 3.0
             if dd < -0.15:
-                reward -= 2.0  # pénalité forte si DD > 15%
+                reward -= 2.0
 
-        # === 4. Petit bonus PnL pour garder le signal informatif ===
-        reward += R_t * 10.0  # scale le return brut
+        # === 5. Holding bonus (réduit le churning) ===
+        if self.time_in_position > 3 and R_t * self.position > 0:
+            # Bonus si on est en position depuis >3 steps et que le trade va dans le bon sens
+            reward += 0.1 * min(self.time_in_position / 20, 1.0)
+
+        # === 6. PnL brut (signal de base) ===
+        reward += R_t * 10.0
 
         return float(np.clip(reward, -10.0, 10.0))
 
@@ -230,9 +269,7 @@ class CryptoTradingEnv(gym.Env):
         dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
         print(
             f"Step {self.current_step} | Balance: {self.balance:.2f} | "
-            f"Position: {self.position:.2f} | "
-            f"DD: {dd:.2%} | "
-            f"Return: {(self.balance - self.initial_balance) / self.initial_balance:.2%}"
+            f"Position: {self.position:.2f} | DD: {dd:.2%}"
         )
 
     def get_performance_metrics(self) -> dict:
@@ -248,62 +285,117 @@ class CryptoTradingEnv(gym.Env):
         downside = np.std(returns[returns < 0]) + 1e-8
         sortino = np.mean(returns) / downside * np.sqrt(252 * 24)
 
+        # CVaR
+        var_5 = np.percentile(returns, 5) if len(returns) > 20 else 0
+        cvar_5 = np.mean(returns[returns <= var_5]) if np.any(returns <= var_5) else 0
+
         return {
             "total_return": float(total_return),
             "sharpe_ratio": float(sharpe),
             "sortino_ratio": float(sortino),
             "max_drawdown": float(max_dd),
             "calmar_ratio": float(total_return / abs(max_dd + 1e-8)),
+            "cvar_5pct": float(cvar_5),
             "total_fees": float(self.total_fees),
         }
 
 
 # =============================================================================
-# FEATURE EXTRACTOR (Transformer 1D)
+# FEATURE EXTRACTOR SSM-INSPIRED
 # =============================================================================
 
-class TransformerFeaturesExtractor(BaseFeaturesExtractor):
+class SSMFeaturesExtractor(BaseFeaturesExtractor):
     """
-    Feature extractor Transformer 1D pour capturer les dépendances temporelles.
+    Feature extractor SSM-inspired (léger) pour capturer les dépendances temporelles.
+    Utilise Conv1D + Gating au lieu du Transformer (plus rapide pour le RL).
     """
 
-    def __init__(self, observation_space: spaces.Box, lookback: int = 50, features_dim: int = 256):
+    def __init__(self, observation_space: spaces.Box, lookback: int = 20,
+                 n_extra: int = 4, features_dim: int = 256):
         super().__init__(observation_space, features_dim=features_dim)
 
         n_total = observation_space.shape[0]
+        self.n_extra = n_extra
         self.lookback = lookback
-        self.n_features = n_total // lookback
+        self.n_features = (n_total - n_extra) // lookback
 
+        # SSM-like block : Conv1D + Gate + Residual
         self.input_proj = nn.Linear(self.n_features, 128)
-        self.layer_norm = nn.LayerNorm(128)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=128, nhead=4, dim_feedforward=256,
-            dropout=0.1, batch_first=True,
+        self.norm1 = nn.LayerNorm(128)
+
+        # Multi-scale Conv1D (capture short + medium + long patterns)
+        self.conv_short = nn.Conv1d(128, 64, kernel_size=3, padding=1)
+        self.conv_med = nn.Conv1d(128, 64, kernel_size=7, padding=3)
+        self.conv_long = nn.Conv1d(128, 64, kernel_size=15, padding=7)
+
+        # Gate mechanism (simplified selective scan)
+        self.gate = nn.Sequential(
+            nn.Linear(192, 192),
+            nn.Sigmoid(),
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.output_proj = nn.Sequential(
-            nn.Linear(128, features_dim),
-            nn.ReLU(),
+
+        self.norm2 = nn.LayerNorm(192)
+
+        # Aggregation
+        self.agg = nn.Sequential(
+            nn.Linear(192 + n_extra, features_dim),
+            nn.GELU(),
             nn.Dropout(0.1),
+            nn.Linear(features_dim, features_dim),
+            nn.GELU(),
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = obs.view(-1, self.lookback, self.n_features)
+        # Séparer features temporelles et extras
+        seq_flat = obs[:, :-self.n_extra]
+        extras = obs[:, -self.n_extra:]
+
+        # Reshape en séquence
+        x = seq_flat.view(-1, self.lookback, self.n_features)
         x = self.input_proj(x)
-        x = self.layer_norm(x)
-        x = self.transformer(x)
-        x = x[:, -1, :]  # dernier token
-        return self.output_proj(x)
+        x = self.norm1(x)
+
+        # Multi-scale convolutions (B, T, C) → (B, C, T)
+        x_t = x.transpose(1, 2)
+        c_short = torch.silu(self.conv_short(x_t))   # (B, 64, T)
+        c_med = torch.silu(self.conv_med(x_t))       # (B, 64, T)
+        c_long = torch.silu(self.conv_long(x_t))     # (B, 64, T)
+
+        # Concat multi-scale → (B, 192, T)
+        multi = torch.cat([c_short, c_med, c_long], dim=1)
+        multi = multi.transpose(1, 2)  # (B, T, 192)
+
+        # Gating (selective scan simplifiée)
+        gate_vals = self.gate(multi)
+        multi = multi * gate_vals
+
+        multi = self.norm2(multi)
+
+        # Dernier token + extras
+        last_token = multi[:, -1, :]  # (B, 192)
+        combined = torch.cat([last_token, extras], dim=1)  # (B, 192 + 4)
+
+        return self.agg(combined)
 
 
 # =============================================================================
-# AGENT RL v2
+# AGENT RL v3 — ENSEMBLE SAC + PPO + DDPG
 # =============================================================================
 
 class RLTradingAgent:
     """
-    Agent RL v2 : SAC par défaut, PPO en fallback.
+    Agent RL v3 — Ensemble de 3 algorithmes.
+
+    Architecture :
+    - SAC : meilleur en haute volatilité (auto-tuning entropie)
+    - PPO : le plus stable et robuste
+    - DDPG : le plus rapide, bon pour trends clairs
+
+    Le signal final est un vote pondéré par la performance récente de chaque agent.
+    Basé sur FinRL ensemble framework (AI4Finance, Columbia).
     """
+
+    ALGOS = {"SAC": SAC, "PPO": PPO, "DDPG": DDPG}
 
     def __init__(self, config_path: str = "config/config.yaml"):
         with open(config_path) as f:
@@ -314,9 +406,17 @@ class RLTradingAgent:
         self.checkpoint_dir = Path(self.cfg["checkpoint_dir"])
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ensemble config
+        ensemble_cfg = self.cfg.get("ensemble_agents", ["SAC"])
+        self.agent_names = ensemble_cfg if isinstance(ensemble_cfg, list) else [ensemble_cfg]
+
+        self.models = {}  # {"SAC": model, "PPO": model, "DDPG": model}
+        self.vec_envs = {}
+        self.agent_weights = {name: 1.0 / len(self.agent_names) for name in self.agent_names}
+
+        # Compatibilité avec l'ancienne interface (single model)
         self.model = None
-        self.vec_env: Optional[VecNormalize] = None
-        self.algo_name = self.cfg.get("algorithm", "SAC")
+        self.algo_name = self.agent_names[0] if self.agent_names else "SAC"
 
     def _make_env(self, features_df, prices_df, mode="train"):
         def _init():
@@ -332,7 +432,7 @@ class RLTradingAgent:
         val_features_df: Optional[pd.DataFrame] = None,
         val_prices_df: Optional[pd.DataFrame] = None,
     ):
-        """Entraîne l'agent RL."""
+        """Entraîne l'ensemble d'agents RL."""
         # Aligner features et prices
         common_idx = features_df.index.intersection(prices_df.index)
         features_df = features_df.loc[common_idx]
@@ -346,108 +446,159 @@ class RLTradingAgent:
         val_feat = val_features_df if val_features_df is not None else features_df.iloc[split:]
         val_prices = val_prices_df if val_prices_df is not None else prices_df.iloc[split:]
 
-        # Environnement d'entraînement
-        env = DummyVecEnv([self._make_env(train_feat, train_prices)])
-        env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
-        self.vec_env = env
-
-        # Feature extractor
         lookback = self.cfg.get("lookback", 20)
-        policy_kwargs = dict(
-            features_extractor_class=TransformerFeaturesExtractor,
-            features_extractor_kwargs=dict(lookback=lookback, features_dim=256),
-            net_arch=dict(pi=[256, 128], vf=[256, 128]),
-            activation_fn=nn.ReLU,
-        )
-
-        # Validation env
-        val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val")])
-        val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
-
-        # Callbacks
-        callbacks = [
-            EvalCallback(
-                val_env,
-                best_model_save_path=str(self.checkpoint_dir),
-                log_path=str(self.checkpoint_dir / "logs"),
-                eval_freq=5000,
-                n_eval_episodes=3,  # 3 épisodes pour eval plus stable
-                deterministic=True,
-            ),
-            CheckpointCallback(
-                save_freq=25000,
-                save_path=str(self.checkpoint_dir),
-                name_prefix="rl_checkpoint",
-            ),
-        ]
-
-        algo = self.cfg.get("algorithm", "SAC")
-        self.algo_name = algo
+        total_timesteps = self.cfg.get("total_timesteps", 500_000)
         lr = float(self.cfg["learning_rate"])
 
-        if algo == "SAC":
-            # SAC : off-policy, plus stable, meilleur pour le trading
-            # net_arch format différent pour SAC
-            sac_policy_kwargs = dict(
-                features_extractor_class=TransformerFeaturesExtractor,
-                features_extractor_kwargs=dict(lookback=lookback, features_dim=256),
+        # Entraîner chaque agent de l'ensemble
+        for algo_name in self.agent_names:
+            logger.info(f"{'='*60}")
+            logger.info(f"Entraînement {algo_name} ({total_timesteps:,} timesteps)")
+            logger.info(f"{'='*60}")
+
+            # Nouveau env pour chaque algo (isolation)
+            env = DummyVecEnv([self._make_env(train_feat, train_prices)])
+            env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+
+            # Validation env
+            val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val")])
+            val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
+
+            # Feature extractor kwargs
+            n_extra = 4
+            fe_kwargs = dict(lookback=lookback, n_extra=n_extra, features_dim=256)
+
+            # Checkpoint dir spécifique à l'algo
+            algo_ckpt = self.checkpoint_dir / algo_name.lower()
+            algo_ckpt.mkdir(parents=True, exist_ok=True)
+
+            # Callbacks
+            callbacks = [
+                EvalCallback(
+                    val_env,
+                    best_model_save_path=str(algo_ckpt),
+                    log_path=str(algo_ckpt / "logs"),
+                    eval_freq=5000,
+                    n_eval_episodes=3,
+                    deterministic=True,
+                ),
+                CheckpointCallback(
+                    save_freq=50000,
+                    save_path=str(algo_ckpt),
+                    name_prefix=f"rl_{algo_name.lower()}_ckpt",
+                ),
+            ]
+
+            # Créer le modèle selon l'algo
+            model = self._create_model(algo_name, env, lr, lookback, n_extra, fe_kwargs)
+
+            logger.info(f"Entraînement {algo_name} : {total_timesteps:,} timesteps | lr={lr}")
+
+            model.learn(
+                total_timesteps=total_timesteps,
+                callback=callbacks,
+                progress_bar=False,
+            )
+
+            # Sauvegarder
+            env.save(str(algo_ckpt / "vec_normalize.pkl"))
+            model.save(str(algo_ckpt / "final_model"))
+
+            self.models[algo_name] = model
+            self.vec_envs[algo_name] = env
+            logger.info(f"Agent {algo_name} entraîné et sauvegardé !")
+
+        # Garder compatibilité avec l'interface single model
+        if self.agent_names:
+            self.model = self.models.get(self.agent_names[0])
+
+        logger.info(f"Ensemble entraîné : {list(self.models.keys())}")
+        return self.models
+
+    def _create_model(self, algo_name, env, lr, lookback, n_extra, fe_kwargs):
+        """Crée un modèle SB3 selon le nom de l'algorithme."""
+
+        if algo_name == "SAC":
+            policy_kwargs = dict(
+                features_extractor_class=SSMFeaturesExtractor,
+                features_extractor_kwargs=fe_kwargs,
                 net_arch=[256, 128],
                 activation_fn=nn.ReLU,
             )
-
-            self.model = SAC(
-                "MlpPolicy",
-                env,
+            return SAC(
+                "MlpPolicy", env,
                 learning_rate=lr,
                 buffer_size=int(self.cfg.get("buffer_size", 500_000)),
                 learning_starts=int(self.cfg.get("learning_starts", 5000)),
-                batch_size=self.cfg.get("batch_size", 512),
+                batch_size=512,
                 tau=float(self.cfg.get("tau", 0.005)),
                 gamma=float(self.cfg.get("gamma", 0.99)),
-                train_freq=4,         # update tous les 4 steps (au lieu de 1)
-                gradient_steps=1,     # 1 gradient step par update → 4x moins de compute
+                train_freq=4,
+                gradient_steps=1,
                 ent_coef="auto",
                 target_entropy="auto",
-                policy_kwargs=sac_policy_kwargs,
-                verbose=1,
-                tensorboard_log="logs/tensorboard/rl",
-                device="auto",
-            )
-
-        elif algo == "PPO":
-            self.model = PPO(
-                "MlpPolicy",
-                env,
-                learning_rate=lr,
-                n_steps=self.cfg.get("n_steps", 1024),
-                batch_size=self.cfg.get("batch_size", 256),
-                n_epochs=self.cfg.get("n_epochs", 10),
-                gamma=float(self.cfg.get("gamma", 0.99)),
-                gae_lambda=float(self.cfg.get("gae_lambda", 0.95)),
-                clip_range=float(self.cfg.get("clip_range", 0.2)),
-                ent_coef=float(self.cfg.get("ent_coef", 0.01)),
-                target_kl=float(self.cfg.get("target_kl", 0.02)),
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
                 device="auto",
             )
 
-        total_timesteps = self.cfg.get("total_timesteps", 500_000)
-        logger.info(f"Entraînement RL ({algo}) : {total_timesteps:,} timesteps | lr={lr}")
+        elif algo_name == "PPO":
+            policy_kwargs = dict(
+                features_extractor_class=SSMFeaturesExtractor,
+                features_extractor_kwargs=fe_kwargs,
+                net_arch=dict(pi=[256, 128], vf=[256, 128]),
+                activation_fn=nn.ReLU,
+            )
+            return PPO(
+                "MlpPolicy", env,
+                learning_rate=lr,
+                n_steps=2048,
+                batch_size=256,
+                n_epochs=10,
+                gamma=float(self.cfg.get("gamma", 0.99)),
+                gae_lambda=0.95,
+                clip_range=0.2,
+                ent_coef=0.01,
+                target_kl=0.02,
+                policy_kwargs=policy_kwargs,
+                verbose=1,
+                tensorboard_log="logs/tensorboard/rl",
+                device="auto",
+            )
 
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            callback=callbacks,
-            progress_bar=False,
-        )
+        elif algo_name == "DDPG":
+            # DDPG avec Ornstein-Uhlenbeck noise pour l'exploration
+            n_actions = 1
+            action_noise = OrnsteinUhlenbeckActionNoise(
+                mean=np.zeros(n_actions),
+                sigma=0.2 * np.ones(n_actions),
+            )
+            policy_kwargs = dict(
+                features_extractor_class=SSMFeaturesExtractor,
+                features_extractor_kwargs=fe_kwargs,
+                net_arch=[256, 128],
+                activation_fn=nn.ReLU,
+            )
+            return DDPG(
+                "MlpPolicy", env,
+                learning_rate=lr,
+                buffer_size=int(self.cfg.get("buffer_size", 500_000)),
+                learning_starts=int(self.cfg.get("learning_starts", 5000)),
+                batch_size=512,
+                tau=float(self.cfg.get("tau", 0.005)),
+                gamma=float(self.cfg.get("gamma", 0.99)),
+                train_freq=4,
+                gradient_steps=1,
+                action_noise=action_noise,
+                policy_kwargs=policy_kwargs,
+                verbose=1,
+                tensorboard_log="logs/tensorboard/rl",
+                device="auto",
+            )
 
-        # Sauvegarder
-        env.save(str(self.checkpoint_dir / "vec_normalize.pkl"))
-        self.model.save(str(self.checkpoint_dir / "rl_final"))
-        logger.info("Agent RL entraîné et sauvegardé !")
-
-        return self.model
+        else:
+            raise ValueError(f"Algorithme inconnu : {algo_name}")
 
     def predict(
         self,
@@ -455,18 +606,24 @@ class RLTradingAgent:
         prices_df: pd.DataFrame,
         deterministic: bool = True,
     ) -> Dict[str, float]:
-        """Génère un signal de trading."""
-        if self.model is None:
+        """
+        Génère un signal de trading via ensemble vote.
+        Chaque agent vote, le signal final est la moyenne pondérée.
+        """
+        # Charger les modèles si nécessaire
+        if not self.models:
             self.load()
 
-        # Ajuster features pour matcher le modèle entraîné
-        expected_obs_size = self.model.observation_space.shape[0]
         lookback = self.cfg.get("lookback", 20)
-        expected_n_features = expected_obs_size // lookback
-        if features_df.shape[1] > expected_n_features:
-            features_df = features_df.iloc[:, :expected_n_features]
-        elif features_df.shape[1] < expected_n_features:
-            logger.warning(f"RL predict: {features_df.shape[1]} features < {expected_n_features} attendues")
+        n_extra = 4
+
+        # Ajuster features
+        if self.models:
+            first_model = next(iter(self.models.values()))
+            expected_obs_size = first_model.observation_space.shape[0]
+            expected_n_features = (expected_obs_size - n_extra) // lookback
+            if features_df.shape[1] > expected_n_features:
+                features_df = features_df.iloc[:, :expected_n_features]
 
         # Env temporaire pour l'inférence
         env = CryptoTradingEnv(
@@ -475,46 +632,105 @@ class RLTradingAgent:
             self.env_cfg,
             mode="inference",
         )
-        obs, _ = env.reset()
 
-        # Avancer jusqu'au dernier step
-        for _ in range(min(100, len(features_df) - 51)):
-            action, _ = self.model.predict(obs, deterministic=deterministic)
-            obs, _, done, _, _ = env.step(action)
-            if done:
-                break
+        # Collecter les prédictions de chaque agent
+        agent_predictions = {}
 
-        # Dernière action = signal courant
-        final_action, _ = self.model.predict(obs, deterministic=deterministic)
-        position = float(np.clip(final_action[0], -1.0, 1.0))
-        direction = 1 if position > 0.1 else (-1 if position < -0.1 else 0)
-        confidence = min(abs(position), 1.0)
+        for algo_name, model in self.models.items():
+            try:
+                obs, _ = env.reset()
+                # Avancer jusqu'au dernier step
+                for _ in range(min(80, len(features_df) - lookback - 10)):
+                    action, _ = model.predict(obs, deterministic=deterministic)
+                    obs, _, done, _, _ = env.step(action)
+                    if done:
+                        obs, _ = env.reset()
+
+                # Dernière action
+                final_action, _ = model.predict(obs, deterministic=deterministic)
+                position = float(np.clip(final_action[0], -1.0, 1.0))
+                agent_predictions[algo_name] = position
+
+            except Exception as e:
+                logger.warning(f"{algo_name} predict failed : {e}")
+                agent_predictions[algo_name] = 0.0
+
+        # Ensemble vote pondéré
+        if not agent_predictions:
+            return {"direction": 0, "confidence": 0.0, "position": 0.0, "model": "rl_ensemble"}
+
+        weighted_position = sum(
+            self.agent_weights.get(name, 1.0 / len(agent_predictions)) * pos
+            for name, pos in agent_predictions.items()
+        )
+        weighted_position /= sum(
+            self.agent_weights.get(name, 1.0 / len(agent_predictions))
+            for name in agent_predictions
+        )
+
+        direction = 1 if weighted_position > 0.1 else (-1 if weighted_position < -0.1 else 0)
+        confidence = min(abs(weighted_position), 1.0)
+
+        # Bonus de confiance si les agents sont d'accord
+        signs = [1 if p > 0.1 else (-1 if p < -0.1 else 0) for p in agent_predictions.values()]
+        agreement = abs(sum(signs)) / max(len(signs), 1)
+        confidence = min(confidence * (0.5 + 0.5 * agreement), 1.0)
 
         return {
             "direction": direction,
             "confidence": confidence,
-            "position": position,
-            "model": f"rl_{self.algo_name.lower()}",
+            "position": float(weighted_position),
+            "model": "rl_ensemble",
+            "agent_votes": agent_predictions,
         }
 
     def load(self, path: Optional[str] = None):
-        """Charge un agent pré-entraîné."""
-        model_path = path or str(self.checkpoint_dir / "best_model")
+        """Charge les agents pré-entraînés."""
+        for algo_name in self.agent_names:
+            algo_ckpt = self.checkpoint_dir / algo_name.lower()
+            model_path = str(algo_ckpt / "best_model")
+            final_path = str(algo_ckpt / "final_model")
 
-        # Détecter le type d'algo sauvegardé
-        try:
-            self.model = SAC.load(model_path)
-            self.algo_name = "SAC"
-            logger.info(f"Agent SAC chargé depuis {model_path}")
-        except Exception:
-            try:
-                self.model = PPO.load(model_path)
-                self.algo_name = "PPO"
-                logger.info(f"Agent PPO chargé depuis {model_path}")
-            except Exception as e:
-                logger.error(f"Impossible de charger le modèle RL : {e}")
-                raise
+            AlgoClass = self.ALGOS.get(algo_name)
+            if AlgoClass is None:
+                continue
 
-        vec_norm_path = self.checkpoint_dir / "vec_normalize.pkl"
-        if vec_norm_path.exists():
-            logger.info("VecNormalize stats chargées")
+            # Essayer best_model d'abord, puis final_model
+            for p in [model_path, final_path]:
+                try:
+                    self.models[algo_name] = AlgoClass.load(p)
+                    logger.info(f"Agent {algo_name} chargé depuis {p}")
+                    break
+                except Exception:
+                    continue
+            else:
+                logger.warning(f"Impossible de charger {algo_name}")
+
+        # Fallback : essayer l'ancien format (single model)
+        if not self.models:
+            old_path = str(self.checkpoint_dir / "best_model")
+            for AlgoClass in [SAC, PPO, DDPG]:
+                try:
+                    model = AlgoClass.load(old_path)
+                    name = AlgoClass.__name__
+                    self.models[name] = model
+                    logger.info(f"Agent {name} chargé depuis {old_path} (ancien format)")
+                    break
+                except Exception:
+                    continue
+
+        # Compatibilité
+        if self.models:
+            self.model = next(iter(self.models.values()))
+
+    def update_weights(self, performance: Dict[str, float]):
+        """
+        Met à jour les poids de l'ensemble basé sur la performance récente.
+        Utilisé en live/backtest pour adapter le vote dynamiquement.
+        """
+        total = sum(max(v, 0.01) for v in performance.values())
+        self.agent_weights = {
+            name: max(performance.get(name, 0.01), 0.01) / total
+            for name in self.agent_names
+        }
+        logger.info(f"Poids ensemble mis à jour : {self.agent_weights}")

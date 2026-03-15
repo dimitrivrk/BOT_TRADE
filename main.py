@@ -1,12 +1,19 @@
 """
-Point d'entrée principal du bot de trading IA.
+Point d'entree principal du bot de trading IA v3.
+
+Architecture 2025 :
+  - CryptoMamba (SSM) pour la prediction de prix
+  - Ensemble RL (SAC + PPO + DDPG) pour la prise de decision
+  - XGBoost feature selection pour les features optimales
+  - Reward risk-aware avec CVaR
 
 Modes disponibles :
-  python main.py --mode live          # Trading en temps réel
-  python main.py --mode backtest      # Backtest sur données historiques
-  python main.py --mode download      # Télécharger les données historiques
-  python main.py --mode train         # Entraîner les modèles IA
-  python main.py --mode walk_forward  # Walk-forward optimization
+  python main.py --mode train --pairs BTC/USDT --model rl
+  python main.py --mode train --pairs BTC/USDT --model mamba
+  python main.py --mode train --pairs BTC/USDT --model all
+  python main.py --mode backtest
+  python main.py --mode download
+  python main.py --mode live
 """
 
 import asyncio
@@ -15,7 +22,6 @@ import signal
 import sys
 from pathlib import Path
 
-# Ajouter le répertoire courant au PYTHONPATH
 sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.logger import setup_logger
@@ -41,16 +47,11 @@ def run_backtest(args):
     all_results = {}
     for symbol in pairs:
         logger.info(f"Backtest : {symbol}")
-        result = engine.run(
-            symbol=symbol,
-            start=args.start,
-            end=args.end,
-        )
+        result = engine.run(symbol=symbol, start=args.start, end=args.end)
         all_results[symbol] = result
 
-    # Afficher le résumé
     print("\n" + "=" * 70)
-    print("RÉSUMÉ BACKTEST")
+    print("RESUME BACKTEST")
     print("=" * 70)
     for symbol, metrics in all_results.items():
         print(f"\n{symbol}:")
@@ -62,6 +63,108 @@ def run_backtest(args):
     print("=" * 70)
 
     return all_results
+
+
+def run_download(args):
+    """Telecharge les donnees historiques."""
+    from data.collectors.historical import HistoricalDataCollector
+    import yaml
+
+    with open("config/config.yaml") as f:
+        config = yaml.safe_load(f)
+
+    collector = HistoricalDataCollector()
+    pairs = args.pairs or config["trading"]["pairs"]
+    collector.fetch_all_pairs(pairs=pairs, days=args.days or 730)
+    logger.info("Telechargement termine !")
+
+
+def run_train(args):
+    """Entraine les modeles IA v3."""
+    import yaml
+    from data.collectors.historical import HistoricalDataCollector
+    from data.processors.features import FeatureEngineer
+
+    with open("config/config.yaml") as f:
+        config = yaml.safe_load(f)
+
+    collector = HistoricalDataCollector()
+    feature_eng = FeatureEngineer()
+    pairs = args.pairs or config["trading"]["pairs"]
+    tf = config["trading"]["timeframes"]["primary"]
+    tf_higher = config["trading"]["timeframes"]["higher"]
+
+    for symbol in pairs:
+        logger.info(f"Entrainement modeles pour {symbol}...")
+
+        # Charger les donnees
+        df = collector.load_data(symbol, tf)
+        df_higher = collector.load_data(symbol, tf_higher)
+
+        if len(df) < 500:
+            logger.warning(f"Donnees insuffisantes pour {symbol}, skip.")
+            continue
+
+        # Features
+        features = feature_eng.compute_all(
+            df, higher_tf_df=df_higher if not df_higher.empty else None
+        )
+        logger.info(f"Features : {features.shape[1]} colonnes, {len(features)} lignes")
+
+        # === Feature Selection (XGBoost) ===
+        selected_features = features
+        if config["models"].get("feature_selection", {}).get("enabled", False):
+            if not args.model or args.model in ("all", "features"):
+                try:
+                    from models.feature_selector import FeatureSelector
+                    selector = FeatureSelector()
+                    selected_features = selector.fit_transform(features, df)
+                    logger.info(f"Features selectionnees : {selected_features.shape[1]} "
+                               f"(sur {features.shape[1]})")
+                except Exception as e:
+                    logger.warning(f"Feature selection echouee : {e}")
+                    selected_features = features
+
+        # === Entrainer CryptoMamba ===
+        if config["models"].get("mamba", {}).get("enabled", True):
+            if not args.model or args.model in ("mamba", "all"):
+                logger.info(f"Entrainement CryptoMamba pour {symbol}...")
+                try:
+                    from models.crypto_mamba import MambaPredictor
+                    mamba = MambaPredictor()
+                    mamba.train(selected_features, df, symbol)
+                    logger.info(f"CryptoMamba entraine pour {symbol}")
+                except Exception as e:
+                    logger.error(f"CryptoMamba training failed : {e}")
+
+        # === Entrainer TFT (fallback) ===
+        if config["models"].get("tft", {}).get("enabled", False):
+            if not args.model or args.model in ("tft", "all"):
+                logger.info(f"Entrainement TFT pour {symbol}...")
+                try:
+                    from models.tft_model import TFTPredictor
+                    tft = TFTPredictor()
+                    tft.train(selected_features, symbol)
+                except Exception as e:
+                    logger.error(f"TFT training failed : {e}")
+
+        # === Entrainer RL Ensemble ===
+        if config["models"]["rl"]["enabled"]:
+            if not args.model or args.model in ("rl", "all"):
+                logger.info(f"Entrainement RL Ensemble pour {symbol}...")
+                try:
+                    from models.rl_agent import RLTradingAgent
+                    rl = RLTradingAgent()
+
+                    # Utiliser les features selectionnees si dispo
+                    rl_features = selected_features if len(selected_features.columns) <= 40 else features
+                    rl.train(rl_features, df)
+                except Exception as e:
+                    logger.error(f"RL training failed : {e}")
+                    import traceback
+                    traceback.print_exc()
+
+    logger.info("Entrainement termine !")
 
 
 def run_walk_forward(args):
@@ -81,93 +184,32 @@ def run_walk_forward(args):
             train_months=args.train_months,
             test_months=args.test_months,
         )
-        print(f"\nWalk-Forward {symbol} : {len(results)} fenêtres")
+        print(f"\nWalk-Forward {symbol} : {len(results)} fenetres")
         for r in results:
             print(
-                f"  [{r.get('window_start')} → {r.get('window_end')}] "
+                f"  [{r.get('window_start')} -> {r.get('window_end')}] "
                 f"Return={r.get('total_return', 0):.2%} | Sharpe={r.get('sharpe_ratio', 0):.2f}"
             )
 
 
-def run_download(args):
-    """Télécharge les données historiques."""
-    from data.collectors.historical import HistoricalDataCollector
-    import yaml
-
-    with open("config/config.yaml") as f:
-        config = yaml.safe_load(f)
-
-    collector = HistoricalDataCollector()
-    pairs = args.pairs or config["trading"]["pairs"]
-    collector.fetch_all_pairs(pairs=pairs, days=args.days or 730)
-    logger.info("Téléchargement terminé !")
-
-
-def run_train(args):
-    """Entraîne les modèles IA."""
-    import yaml
-    from data.collectors.historical import HistoricalDataCollector
-    from data.processors.features import FeatureEngineer
-    from models.tft_model import TFTPredictor
-    from models.rl_agent import RLTradingAgent
-
-    with open("config/config.yaml") as f:
-        config = yaml.safe_load(f)
-
-    collector = HistoricalDataCollector()
-    feature_eng = FeatureEngineer()
-    pairs = args.pairs or config["trading"]["pairs"]
-    tf = config["trading"]["timeframes"]["primary"]
-    tf_higher = config["trading"]["timeframes"]["higher"]
-
-    for symbol in pairs:
-        logger.info(f"Entraînement modèles pour {symbol}...")
-
-        # Charger les données
-        df = collector.load_data(symbol, tf)
-        df_higher = collector.load_data(symbol, tf_higher)
-
-        if len(df) < 500:
-            logger.warning(f"Données insuffisantes pour {symbol}, skip.")
-            continue
-
-        # Features
-        features = feature_eng.compute_all(df, higher_tf_df=df_higher if not df_higher.empty else None)
-
-        # Entraîner TFT
-        if config["models"]["tft"]["enabled"] and (not args.model or args.model == "tft"):
-            logger.info(f"Entraînement TFT pour {symbol}...")
-            tft = TFTPredictor()
-            tft.train(features, symbol)
-
-        # Entraîner RL
-        if config["models"]["rl"]["enabled"] and (not args.model or args.model == "rl"):
-            logger.info(f"Entraînement RL pour {symbol}...")
-            rl = RLTradingAgent()
-            rl.train(features, df)
-
-    logger.info("Entraînement terminé !")
-
-
 async def run_live(args):
-    """Lance le trading en temps réel."""
+    """Lance le trading en temps reel."""
     from strategies.ml_strategy import MLTradingStrategy
 
     strategy = MLTradingStrategy()
-
-    # Gestion propre des signaux d'arrêt
     loop = asyncio.get_event_loop()
 
     def shutdown(sig, frame):
-        logger.info(f"Signal {sig} reçu, arrêt en cours...")
+        logger.info(f"Signal {sig} recu, arret en cours...")
         strategy.stop()
         loop.stop()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    logger.info("=== BOT DE TRADING IA DÉMARRÉ ===")
-    logger.info("Ctrl+C pour arrêter proprement")
+    logger.info("=== BOT DE TRADING IA v3 DEMARRE ===")
+    logger.info("Architecture : CryptoMamba + RL Ensemble (SAC+PPO+DDPG)")
+    logger.info("Ctrl+C pour arreter proprement")
 
     await strategy.run()
 
@@ -178,26 +220,29 @@ async def run_live(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bot de Trading IA Crypto - TFT + RL + Ensemble"
+        description="Bot de Trading IA Crypto v3 — CryptoMamba + RL Ensemble"
     )
     parser.add_argument(
         "--mode",
         choices=["live", "backtest", "download", "train", "walk_forward"],
         default="backtest",
-        help="Mode d'exécution",
+        help="Mode d'execution",
     )
     parser.add_argument(
-        "--pairs",
-        nargs="+",
-        help="Paires à trader (ex: BTC/USDT ETH/USDT)",
+        "--pairs", nargs="+",
+        help="Paires a trader (ex: BTC/USDT ETH/USDT)",
     )
-    parser.add_argument("--start", type=str, help="Date de début (YYYY-MM-DD)")
+    parser.add_argument("--start", type=str, help="Date de debut (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="Date de fin (YYYY-MM-DD)")
     parser.add_argument("--days", type=int, help="Nombre de jours d'historique")
-    parser.add_argument("--model", choices=["tft", "rl", "all"], help="Modèle à entraîner")
-    parser.add_argument("--train-months", type=int, default=6, help="Mois d'entraînement (walk-forward)")
-    parser.add_argument("--test-months", type=int, default=1, help="Mois de test (walk-forward)")
-    parser.add_argument("--config", type=str, default="config/config.yaml", help="Fichier de configuration")
+    parser.add_argument(
+        "--model",
+        choices=["mamba", "tft", "rl", "features", "all"],
+        help="Modele a entrainer",
+    )
+    parser.add_argument("--train-months", type=int, default=6)
+    parser.add_argument("--test-months", type=int, default=1)
+    parser.add_argument("--config", type=str, default="config/config.yaml")
 
     args = parser.parse_args()
 

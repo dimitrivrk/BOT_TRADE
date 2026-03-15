@@ -1,6 +1,11 @@
 """
-Ensemble des modèles : TFT + RL + signaux techniques.
-Combine les prédictions par stacking ou vote pondéré.
+Ensemble v3 : CryptoMamba + RL Ensemble (SAC+PPO+DDPG) + Signaux techniques.
+
+Architecture état de l'art 2025 :
+- CryptoMamba (SSM) remplace TFT pour la prédiction de prix
+- Ensemble de 3 agents RL avec vote pondéré dynamique
+- XGBoost feature selection pour des features optimales
+- Adaptation dynamique des poids par régime de marché
 """
 
 import numpy as np
@@ -8,8 +13,6 @@ import pandas as pd
 from typing import Dict, List, Optional
 import yaml
 
-from models.tft_model import TFTPredictor
-from models.rl_agent import RLTradingAgent
 from utils.logger import setup_logger
 
 logger = setup_logger("models.ensemble")
@@ -17,12 +20,12 @@ logger = setup_logger("models.ensemble")
 
 class EnsemblePredictor:
     """
-    Combine TFT, RL et signaux techniques en un signal final.
+    Combine CryptoMamba, RL Ensemble et signaux techniques.
 
-    Méthodes disponibles :
-    - 'weighted' : moyenne pondérée des signaux
-    - 'stacking' : meta-modèle appris sur les prédictions individuelles
-    - 'voting'   : vote majoritaire avec seuil de confiance
+    Poids par défaut :
+    - Mamba (prédiction prix) : 40%
+    - RL Ensemble (décision) : 40%
+    - Technique (confirmation) : 20%
     """
 
     def __init__(self, config_path: str = "config/config.yaml"):
@@ -31,14 +34,53 @@ class EnsemblePredictor:
 
         self.cfg = cfg["models"]["ensemble"]
         self.method = self.cfg.get("method", "weighted")
-        self.tft_weight = self.cfg.get("tft_weight", 0.4)
-        self.rl_weight = self.cfg.get("rl_weight", 0.4)
-        self.technical_weight = self.cfg.get("technical_weight", 0.2)
-        self.confidence_threshold = self.cfg.get("confidence_threshold", 0.60)
+        self.mamba_weight = self.cfg.get("mamba_weight", 0.40)
+        self.rl_weight = self.cfg.get("rl_weight", 0.40)
+        self.technical_weight = self.cfg.get("technical_weight", 0.20)
+        self.confidence_threshold = self.cfg.get("confidence_threshold", 0.25)
 
-        # Modèles
-        self.tft = TFTPredictor(config_path) if cfg["models"]["tft"]["enabled"] else None
-        self.rl = RLTradingAgent(config_path) if cfg["models"]["rl"]["enabled"] else None
+        # Lazy loading des modèles
+        self.mamba = None
+        self.rl = None
+        self._models_loaded = False
+
+        # Stocker le config path pour lazy loading
+        self._config_path = config_path
+        self._cfg = cfg
+
+    def _load_models(self):
+        """Charge les modèles à la demande (lazy loading)."""
+        if self._models_loaded:
+            return
+
+        # CryptoMamba
+        if self._cfg["models"].get("mamba", {}).get("enabled", True):
+            try:
+                from models.crypto_mamba import MambaPredictor
+                self.mamba = MambaPredictor(self._config_path)
+                logger.info("CryptoMamba initialisé")
+            except Exception as e:
+                logger.warning(f"CryptoMamba non disponible : {e}")
+
+        # RL Ensemble
+        if self._cfg["models"]["rl"]["enabled"]:
+            try:
+                from models.rl_agent import RLTradingAgent
+                self.rl = RLTradingAgent(self._config_path)
+                logger.info("RL Ensemble initialisé")
+            except Exception as e:
+                logger.warning(f"RL Ensemble non disponible : {e}")
+
+        # Fallback TFT si Mamba pas dispo
+        if self.mamba is None and self._cfg["models"].get("tft", {}).get("enabled", False):
+            try:
+                from models.tft_model import TFTPredictor
+                self.mamba = TFTPredictor(self._config_path)
+                logger.info("Fallback TFT chargé (Mamba non disponible)")
+            except Exception as e:
+                logger.warning(f"TFT fallback non disponible : {e}")
+
+        self._models_loaded = True
 
     def predict(
         self,
@@ -50,33 +92,29 @@ class EnsemblePredictor:
         """
         Génère le signal final combiné.
 
-        Args:
-            features_df: Features normalisées
-            prices_df: OHLCV brut
-            symbol: Paire tradée
-            regime: Régime de marché détecté (optionnel, pour adapter les poids)
-
         Returns:
             {
                 'direction': -1|0|1,
                 'confidence': float (0-1),
-                'position_size': float (0-1),  # fraction du capital
-                'signal_details': dict          # décomposition par modèle
+                'position_size': float (0-1),
+                'signal_details': dict
             }
         """
+        self._load_models()
         signals = {}
 
-        # --- Signal TFT ---
-        if self.tft and self.tft.model is not None:
+        # --- Signal CryptoMamba (prédiction de prix) ---
+        if self.mamba is not None:
             try:
-                tft_signal = self.tft.predict(features_df, symbol)
-                signals['tft'] = tft_signal
+                if hasattr(self.mamba, 'model') and self.mamba.model is not None:
+                    mamba_signal = self.mamba.predict(features_df, symbol)
+                    signals['mamba'] = mamba_signal
             except Exception as e:
-                logger.warning(f"TFT predict failed : {e}")
-                signals['tft'] = {"direction": 0, "confidence": 0.0}
+                logger.warning(f"Mamba predict failed : {e}")
+                signals['mamba'] = {"direction": 0, "confidence": 0.0}
 
-        # --- Signal RL ---
-        if self.rl and self.rl.model is not None:
+        # --- Signal RL Ensemble ---
+        if self.rl is not None:
             try:
                 rl_signal = self.rl.predict(features_df, prices_df)
                 signals['rl'] = rl_signal
@@ -92,17 +130,11 @@ class EnsemblePredictor:
         weights = self._get_regime_weights(regime)
 
         # --- Combinaison ---
-        if self.method == "weighted":
-            final_signal = self._weighted_vote(signals, weights)
-        elif self.method == "voting":
-            final_signal = self._majority_vote(signals)
-        else:
-            final_signal = self._weighted_vote(signals, weights)
+        final_signal = self._weighted_vote(signals, weights)
 
         # --- Position sizing basé sur la confiance ---
         final_signal['position_size'] = self._compute_position_size(
-            final_signal['confidence'],
-            regime,
+            final_signal['confidence'], regime,
         )
         final_signal['signal_details'] = signals
         final_signal['regime'] = regime
@@ -116,10 +148,7 @@ class EnsemblePredictor:
         return final_signal
 
     def _compute_technical_signal(self, features_df: pd.DataFrame) -> Dict:
-        """
-        Signal technique basé sur les features calculées.
-        Utilise un ensemble de règles de trading classiques.
-        """
+        """Signal technique basé sur les features calculées."""
         if features_df.empty:
             return {"direction": 0, "confidence": 0.0}
 
@@ -129,10 +158,10 @@ class EnsemblePredictor:
 
         # RSI
         if 'rsi_14' in last.index:
-            rsi = last['rsi_14']  # déjà normalisé 0-1
-            if rsi < 0.3:         # oversold
+            rsi = last['rsi_14']
+            if rsi < 0.3:
                 score += 1.0
-            elif rsi > 0.7:       # overbought
+            elif rsi > 0.7:
                 score -= 1.0
             n_signals += 1
 
@@ -162,14 +191,14 @@ class EnsemblePredictor:
 
         # Squeeze Momentum
         if 'sq_momentum' in last.index and 'sq_on' in last.index:
-            if last['sq_on'] == 0:  # squeeze vient de se relâcher
+            if last['sq_on'] == 0:
                 score += np.sign(last['sq_momentum']) * 0.5
                 n_signals += 0.5
 
         if n_signals == 0:
             return {"direction": 0, "confidence": 0.0}
 
-        normalized_score = score / n_signals  # [-1, 1]
+        normalized_score = score / n_signals
         direction = 1 if normalized_score > 0.2 else (-1 if normalized_score < -0.2 else 0)
         confidence = min(abs(normalized_score), 1.0)
 
@@ -186,12 +215,19 @@ class EnsemblePredictor:
         total_weight = 0.0
         weighted_confidence = 0.0
 
+        # Mapping des noms de modèles aux poids
+        weight_map = {
+            'mamba': weights.get('mamba', 0.4),
+            'tft': weights.get('mamba', 0.4),  # TFT utilise le même poids que Mamba
+            'rl': weights.get('rl', 0.4),
+            'technical': weights.get('technical', 0.2),
+        }
+
         for model_name, signal in signals.items():
-            w = weights.get(model_name, 0.0)
+            w = weight_map.get(model_name, 0.0)
             if w == 0 or signal.get('confidence', 0) == 0:
                 continue
 
-            # Score pondéré par la confiance du modèle
             model_score = signal['direction'] * signal['confidence']
             total_score += w * model_score
             weighted_confidence += w * signal['confidence']
@@ -203,9 +239,8 @@ class EnsemblePredictor:
         final_score = total_score / total_weight
         final_confidence = weighted_confidence / total_weight
 
-        direction = 1 if final_score > 0.2 else (-1 if final_score < -0.2 else 0)
+        direction = 1 if final_score > 0.15 else (-1 if final_score < -0.15 else 0)
 
-        # Bloquer si confiance insuffisante
         if final_confidence < self.confidence_threshold:
             direction = 0
 
@@ -215,79 +250,36 @@ class EnsemblePredictor:
             "raw_score": float(final_score),
         }
 
-    def _majority_vote(self, signals: Dict) -> Dict:
-        """Vote majoritaire simple."""
-        votes = [s['direction'] for s in signals.values() if s.get('confidence', 0) > 0.3]
-        confidences = [s['confidence'] for s in signals.values() if s.get('confidence', 0) > 0.3]
-
-        if not votes:
-            return {"direction": 0, "confidence": 0.0}
-
-        vote_sum = sum(votes)
-        direction = 1 if vote_sum > 0 else (-1 if vote_sum < 0 else 0)
-
-        # Confiance proportionnelle à l'unanimité
-        unanimity = abs(vote_sum) / len(votes)
-        avg_confidence = np.mean(confidences)
-        final_confidence = unanimity * avg_confidence
-
-        if final_confidence < self.confidence_threshold:
-            direction = 0
-
-        return {
-            "direction": direction,
-            "confidence": float(final_confidence),
-        }
-
     def _get_regime_weights(self, regime: Optional[str]) -> Dict:
-        """
-        Adapte les poids au régime de marché.
-        Le TFT performe mieux en tendance, le RL en ranging.
-        """
+        """Adapte les poids au régime de marché."""
         base = {
-            'tft': self.tft_weight,
+            'mamba': self.mamba_weight,
             'rl': self.rl_weight,
             'technical': self.technical_weight,
         }
 
         if regime == 'trending_bull' or regime == 'trending_bear':
-            # En tendance → favoriser TFT (meilleure capture des tendances)
-            base['tft'] = min(base['tft'] * 1.3, 0.6)
+            base['mamba'] = min(base['mamba'] * 1.3, 0.55)
             base['technical'] = max(base['technical'] * 0.7, 0.1)
-
         elif regime == 'ranging':
-            # En range → favoriser RL et signaux techniques (RSI oversold/overbought)
-            base['rl'] = min(base['rl'] * 1.3, 0.6)
-            base['technical'] = min(base['technical'] * 1.3, 0.4)
-
+            base['rl'] = min(base['rl'] * 1.3, 0.55)
+            base['technical'] = min(base['technical'] * 1.3, 0.35)
         elif regime == 'volatile':
-            # Volatile → réduire toutes les positions
-            base = {k: v * 0.5 for k, v in base.items()}
+            base = {k: v * 0.6 for k, v in base.items()}
 
-        # Normaliser
         total = sum(base.values())
         return {k: v / total for k, v in base.items()}
 
-    def _compute_position_size(
-        self,
-        confidence: float,
-        regime: Optional[str],
-    ) -> float:
-        """
-        Calcule la taille de position en % du capital.
-        Basé sur Kelly fractionné × confiance × ajustement régime.
-        """
-        # Base : proportionnel à la confiance
+    def _compute_position_size(self, confidence: float, regime: Optional[str]) -> float:
+        """Position sizing basé sur confiance + régime."""
         base_size = confidence
 
-        # Réduire en régime volatile
         if regime == 'volatile':
             base_size *= 0.5
         elif regime == 'ranging':
             base_size *= 0.7
 
-        # Kelly fractionné (25% du Kelly full)
         kelly_fraction = 0.25
         position_size = base_size * kelly_fraction
 
-        return float(np.clip(position_size, 0.0, 0.15))  # max 15% du capital
+        return float(np.clip(position_size, 0.0, 0.15))

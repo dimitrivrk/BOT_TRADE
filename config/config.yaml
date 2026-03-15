@@ -1,9 +1,9 @@
 # =============================================================================
-# BOT TRADING CONFIG - CRYPTO AI BOT
+# BOT TRADING CONFIG v3 — CRYPTO AI BOT (State of the Art 2025)
 # =============================================================================
 
 exchange:
-  name: "bybit"          # binance | bybit | kraken | okx
+  name: "bybit"            # binance | bybit | kraken | okx
   sandbox: true            # true = testnet (IMPORTANT: mettre false en prod)
   rate_limit: true
   timeout: 30000
@@ -13,12 +13,11 @@ trading:
     - "BTC/USDT"
     - "ETH/USDT"
     - "SOL/USDT"
-    - "BNB/USDT"
   base_currency: "USDT"
   timeframes:
     primary: "1h"          # timeframe principal pour les signaux
     higher: "4h"           # confirmation higher timeframe
-    lower: "15m"           # entrée précise lower timeframe
+    lower: "15m"           # entree precise lower timeframe
   market_type: "futures"   # spot | futures
   leverage: 3              # levier max (1 = pas de levier)
 
@@ -31,12 +30,11 @@ capital:
 data:
   historical_days: 730     # 2 ans d'historique
   warmup_candles: 200      # bougies de chauffe indicateurs
-  storage: "sqlite"        # sqlite | postgresql | timescaledb
+  storage: "sqlite"
   db_path: "data/storage/market_data.db"
   cache_dir: "data/cache"
 
 features:
-  # Indicateurs techniques
   indicators:
     trend:
       - name: "EMA"
@@ -74,83 +72,101 @@ features:
       - name: "CMF"
         period: 20
     patterns:
-      - name: "CandlePatterns"   # doji, hammer, engulfing...
+      - name: "CandlePatterns"
 
-  # Features avancées
   advanced:
-    orderbook_depth: 10          # niveaux de carnet d'ordres
-    funding_rate: true           # taux de financement futures
-    open_interest: true          # intérêt ouvert
-    liquidations: true           # données de liquidations
-    fear_greed_index: true       # indice peur/cupidité
+    orderbook_depth: 10
+    funding_rate: true
+    open_interest: true
+    liquidations: true
+    fear_greed_index: true
 
-  # Fenêtres temporelles pour les features
   lookback_windows: [5, 10, 20, 50, 100]
-
-  # Normalisation
-  normalization: "rolling_zscore" # rolling_zscore | minmax | robust
+  normalization: "rolling_zscore"
 
 models:
-  # --- Temporal Fusion Transformer ---
-  tft:
+  # --- CryptoMamba (SSM — remplace TFT) ---
+  mamba:
     enabled: true
-    hidden_size: 64           # 256 en prod (GPU) — 64 pour CPU rapide
-    lstm_layers: 1            # 2 en prod — 1 pour CPU
-    num_attention_heads: 4    # 8 en prod — 4 pour CPU
+    d_model: 128          # dimension du modele SSM
+    n_layers: 4           # nombre de C-Blocks
+    d_state: 16           # dimension de l'etat SSM
+    d_conv: 4             # taille du noyau convolutif
     dropout: 0.1
-    horizon: 6                # prédire 6 pas en avant (6h)
-    encoder_steps: 168        # fenêtre d'encodage (1 semaine en 1h)
-    batch_size: 128           # plus grand batch = moins de steps/epoch
-    max_epochs: 30            # 100 en prod — 30 pour valider le pipeline
-    learning_rate: 1e-3
+    horizon: 6            # predire 6 pas en avant (6h)
+    lookback: 168         # fenetre d'encodage (1 semaine en 1h)
+    batch_size: 128
+    max_epochs: 50
+    learning_rate: 5e-4
+    weight_decay: 1e-5
     scheduler: "cosine"
     gradient_clip: 1.0
+    checkpoint_dir: "checkpoints/mamba"
+
+  # --- TFT (fallback si Mamba non disponible) ---
+  tft:
+    enabled: false         # desactive par defaut (Mamba le remplace)
+    hidden_size: 64
+    lstm_layers: 1
+    num_attention_heads: 4
+    dropout: 0.1
+    horizon: 6
+    encoder_steps: 168
+    batch_size: 128
+    max_epochs: 30
+    learning_rate: 1e-3
     checkpoint_dir: "checkpoints/tft"
 
-  # --- Reinforcement Learning (SAC) ---
+  # --- Reinforcement Learning v3 (Ensemble SAC + PPO + DDPG) ---
   rl:
     enabled: true
-    algorithm: "SAC"           # SAC (recommande) | PPO
-    policy: "MlpPolicy"
-    # SAC params
-    buffer_size: 500000        # replay buffer (off-policy)
-    learning_starts: 5000      # steps avant de commencer a apprendre
-    batch_size: 256
-    tau: 0.005                 # soft update du target network
-    # PPO fallback params
-    n_steps: 1024              # reduit vs 2048 pour updates plus stables
-    n_epochs: 10
-    gae_lambda: 0.95
-    clip_range: 0.2
-    ent_coef: 0.01
-    target_kl: 0.02            # NOUVEAU: stoppe les updates si KL > 0.02
-    # Commun
-    learning_rate: 1e-4        # 3x plus bas que avant (plus stable)
+    # Ensemble : entrainer les 3 agents (ou un sous-ensemble)
+    ensemble_agents:
+      - "SAC"              # Meilleur en haute volatilite
+      - "PPO"              # Le plus stable et robuste
+      - "DDPG"             # Le plus rapide, bon pour trends clairs
+    # Params communs
+    learning_rate: 1e-4
     gamma: 0.99
-    total_timesteps: 500000    # 500k suffisent avec SAC (plus efficient)
+    buffer_size: 500000
+    learning_starts: 5000
+    tau: 0.005
+    total_timesteps: 500000
+    lookback: 20           # fenetre d'observation RL
     checkpoint_dir: "checkpoints/rl"
     env:
       initial_balance: 10000
       max_position_pct: 0.5
       transaction_cost: 0.001
-      reward_type: "differential_sharpe"  # NOUVEAU: DSR au lieu de sharpe rolling
+      reward_type: "risk_aware"
+      lookback: 20
+      cvar_alpha: 0.05     # 5% tail risk pour CVaR
+      cvar_lambda: 0.5     # poids de la penalite CVaR
 
-  # --- Ensemble ---
+  # --- Feature Selection (XGBoost) ---
+  feature_selection:
+    enabled: true
+    method: "xgboost"      # xgboost | mutual_info | correlation
+    n_features: 30         # nombre de features a garder
+    correlation_threshold: 0.95  # supprimer features correlees > 95%
+    cache_dir: "checkpoints/feature_selection"
+
+  # --- Ensemble (combine Mamba + RL + Technique) ---
   ensemble:
     enabled: true
-    method: "weighted"         # weighted | voting
-    tft_weight: 0.45
-    rl_weight: 0.35
-    technical_weight: 0.20
-    confidence_threshold: 0.25  # seuil de confiance pour trader
+    method: "weighted"     # weighted | voting
+    mamba_weight: 0.40     # poids CryptoMamba (prediction prix)
+    rl_weight: 0.40        # poids RL Ensemble (decision)
+    technical_weight: 0.20 # poids signaux techniques (confirmation)
+    confidence_threshold: 0.25
 
 backtesting:
   engine: "vectorbt"
   start_date: "2023-01-01"
   end_date: "2024-12-31"
   initial_capital: 10000.0
-  commission: 0.001          # 0.1%
-  slippage: 0.0005           # 0.05%
+  commission: 0.001
+  slippage: 0.0005
   metrics:
     - "total_return"
     - "sharpe_ratio"
@@ -166,29 +182,24 @@ backtesting:
     test_months: 1
 
 risk:
-  # Stop Loss / Take Profit dynamiques (ATR-based)
   stop_loss:
-    method: "atr"            # atr | fixed | trailing | none
+    method: "atr"
     atr_multiplier: 2.0
   take_profit:
-    method: "rr_ratio"       # rr_ratio | atr | none
-    rr_ratio: 2.5            # risk/reward ratio
-
-  # Gestion du portefeuille
-  position_sizing: "kelly"   # kelly | fixed | volatility_parity
-  kelly_fraction: 0.25       # Kelly fractionné (sécurité)
-
-  # Circuit breakers
+    method: "rr_ratio"
+    rr_ratio: 2.5
+  position_sizing: "kelly"
+  kelly_fraction: 0.25
   max_consecutive_losses: 5
   daily_loss_limit_pct: 0.05
 
 logging:
-  level: "DEBUG"              # DEBUG | INFO | WARNING | ERROR
+  level: "DEBUG"
   file: "logs/bot.log"
   max_size_mb: 100
   backup_count: 10
 
 monitoring:
-  dashboard_port: 8050       # port Dash
-  telegram_alerts: false     # mettre true si token configuré
+  dashboard_port: 8050
+  telegram_alerts: false
   discord_alerts: false
