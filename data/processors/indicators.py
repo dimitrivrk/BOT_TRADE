@@ -1,15 +1,12 @@
 """
 Bibliothèque d'indicateurs techniques.
-Implémentés en pandas/numpy pur + pandas_ta pour les standards.
+Implémentés en pandas/numpy pur (sans dépendance externe pandas-ta).
 Inclut des indicateurs avancés custom.
 """
 
 import numpy as np
 import pandas as pd
 from typing import Optional, Tuple
-import pandas_ta as ta
-
-
 # =============================================================================
 # TENDANCE
 # =============================================================================
@@ -285,23 +282,46 @@ def hurst_exponent(series: pd.Series, min_lag: int = 2, max_lag: int = 20) -> pd
     return series.rolling(100).apply(_hurst, raw=True)
 
 
+def adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Average Directional Index (ADX) + DI+/DI- en numpy/pandas pur."""
+    high, low, close = df['high'], df['low'], df['close']
+    # True Range
+    hl = high - low
+    hc = (high - close.shift(1)).abs()
+    lc = (low - close.shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    # Directional Movement
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    # Wilder smoothing
+    def wilder_smooth(s, n):
+        result = s.copy().astype(float)
+        result.iloc[:n] = np.nan
+        result.iloc[n] = s.iloc[1:n+1].sum()
+        for i in range(n + 1, len(s)):
+            result.iloc[i] = result.iloc[i - 1] - result.iloc[i - 1] / n + s.iloc[i]
+        return result
+    atr_w = wilder_smooth(tr, period)
+    plus_dm_w = wilder_smooth(plus_dm, period)
+    minus_dm_w = wilder_smooth(minus_dm, period)
+    plus_di = 100 * plus_dm_w / (atr_w + 1e-10)
+    minus_di = 100 * minus_dm_w / (atr_w + 1e-10)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    adx_vals = wilder_smooth(dx.fillna(0), period)
+    return pd.DataFrame({'adx': adx_vals, 'dmp': plus_di, 'dmn': minus_di}, index=df.index)
+
+
 def market_regime(df: pd.DataFrame, period: int = 20) -> pd.Series:
     """
     Détection du régime de marché basée sur ADX + Hurst.
     Returns : 'trending_bull' | 'trending_bear' | 'ranging' | 'volatile'
     """
-    adx_df = ta.adx(df['high'], df['low'], df['close'], length=period)
-    adx_col = f'ADX_{period}'
-    dmp_col = f'DMP_{period}'
-    dmn_col = f'DMN_{period}'
-
-    if adx_col not in adx_df.columns:
-        adx_df.columns = ['adx', 'dmp', 'dmn']
-        adx_col, dmp_col, dmn_col = 'adx', 'dmp', 'dmn'
-
-    adx_vals = adx_df[adx_col]
-    dmp = adx_df[dmp_col]
-    dmn = adx_df[dmn_col]
+    adx_df = adx(df, period)
+    adx_vals = adx_df['adx']
+    dmp = adx_df['dmp']
+    dmn = adx_df['dmn']
     hv = historical_volatility(df['close'], period)
     hv_norm = (hv - hv.rolling(100).min()) / (hv.rolling(100).max() - hv.rolling(100).min() + 1e-10)
 
