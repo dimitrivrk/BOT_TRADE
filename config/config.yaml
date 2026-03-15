@@ -134,6 +134,7 @@ models:
     total_timesteps: 100000  # ~28 min a 60fps → premier resultat rapide
     lookback: 10             # fenetre reduite = obs plus petite = plus rapide
     checkpoint_dir: "checkpoints/rl"
+    n_envs: 8                # envs paralleles (SubprocVecEnv) → ~400fps sur 31 vCPU
     eval_freq: 20000         # eval toutes les 20k steps (pas 5k)
     n_eval_episodes: 1       # 1 seul episode d'eval (pas 3)
     feature_extractor: "mlp" # mlp = rapide, ssm = precis mais lent

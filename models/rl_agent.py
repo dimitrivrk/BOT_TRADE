@@ -19,7 +19,7 @@ import yaml
 import pickle
 
 from stable_baselines3 import PPO, SAC, DDPG
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
     EvalCallback, CheckpointCallback, BaseCallback
 )
@@ -478,9 +478,10 @@ class RLTradingAgent:
         eval_freq = self.cfg.get("eval_freq", 20000)
         n_eval_episodes = self.cfg.get("n_eval_episodes", 1)
         fe_type = self.cfg.get("feature_extractor", "mlp")
+        n_envs = self.cfg.get("n_envs", 8)  # Nombre d'envs parallèles
 
         logger.info(f"Config: {total_timesteps:,} steps | lookback={lookback} | "
-                     f"lr={lr} | extractor={fe_type} | agents={self.agent_names}")
+                     f"lr={lr} | extractor={fe_type} | n_envs={n_envs} | agents={self.agent_names}")
 
         # Entraîner chaque agent de l'ensemble
         for algo_name in self.agent_names:
@@ -488,11 +489,14 @@ class RLTradingAgent:
             logger.info(f"Entraînement {algo_name} ({total_timesteps:,} timesteps)")
             logger.info(f"{'='*60}")
 
-            # Nouveau env pour chaque algo (isolation)
-            env = DummyVecEnv([self._make_env(train_feat, train_prices)])
+            # Envs parallèles (SubprocVecEnv = 1 process par env = N cores utilisés)
+            if n_envs > 1:
+                env = SubprocVecEnv([self._make_env(train_feat, train_prices) for _ in range(n_envs)])
+            else:
+                env = DummyVecEnv([self._make_env(train_feat, train_prices)])
             env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
 
-            # Validation env
+            # Validation env (toujours DummyVecEnv — pas besoin de paralléliser l'eval)
             val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val")])
             val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
 
