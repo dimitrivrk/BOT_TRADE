@@ -159,10 +159,10 @@ models:
   ensemble:
     enabled: true
     method: "weighted"     # weighted | voting
-    mamba_weight: 0.40     # poids CryptoMamba (prediction prix)
-    rl_weight: 0.40        # poids RL Ensemble (decision)
-    technical_weight: 0.20 # poids signaux techniques (confirmation)
-    confidence_threshold: 0.25
+    mamba_weight: 0.00     # pas encore entraine → desactive pour l'instant
+    rl_weight: 0.70        # RL Ensemble = signal principal
+    technical_weight: 0.30 # signaux techniques = confirmation
+    confidence_threshold: 0.15  # baisse car pas de Mamba (remonter a 0.25 quand Mamba actif)
 
 backtesting:
   engine: "vectorbt"
