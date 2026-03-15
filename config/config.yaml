@@ -135,7 +135,7 @@ models:
     lookback: 20             # fenetre complete
     checkpoint_dir: "checkpoints/rl"
     n_envs: 16               # envs paralleles (SubprocVecEnv) → ~1300fps sur 31 vCPU
-    eval_freq: 10000         # eval toutes les 10k steps
+    eval_freq: 3000          # eval toutes les ~50k timesteps (3000 × 16 envs = 48k)
     n_eval_episodes: 3       # 3 episodes d'eval
     feature_extractor: "ssm" # ssm = Conv1D multi-scale (precis)
     env:
