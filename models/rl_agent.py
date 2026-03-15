@@ -206,67 +206,37 @@ class CryptoTradingEnv(gym.Env):
 
     def _compute_reward(self, position_change: float) -> float:
         """
-        Reward risk-aware v3.1 (rééquilibrée) :
-        Le signal principal est le PnL. Les pénalités sont des régulateurs légers,
-        pas le signal dominant. L'agent doit TRADER pour gagner de la reward.
-        """
-        if len(self.returns_history) < 2:
-            return 0.0
+        Reward v3.2 — Simple et efficace.
 
-        R_t = self.returns_history[-1]
+        Signal principal : position × market_return (directement, pas le PnL portfolio).
+        Quand position = 0, le signal est TOUJOURS 0 → gradient clair pour l'agent.
+        Long et marché monte → positif. Short et marché baisse → positif.
+        """
+        if self.current_step < len(self.returns):
+            market_return = self.returns[self.current_step - 1]
+        else:
+            market_return = 0.0
+
         reward = 0.0
 
-        # === 1. PnL — SIGNAL PRINCIPAL (doit dominer la reward) ===
-        # R_t est un log-return 1h (~0.001), on scale ×1000 pour que ce soit le signal dominant
-        pnl_reward = R_t * 1000.0
-        reward += float(np.clip(pnl_reward, -5.0, 5.0))
+        # === 1. SIGNAL DIRECTIONNEL (95% de la reward) ===
+        # position ∈ [-1, 1], market_return ≈ ±0.001 pour 1h
+        # Scale ×500 → reward ≈ ±0.5 par step quand fully invested
+        directional = self.position * market_return * 500.0
+        reward += float(np.clip(directional, -3.0, 3.0))
 
-        # === 2. Differential Sharpe Ratio (bonus, pas dominant) ===
-        A_new = self.A_prev + self.eta * (R_t - self.A_prev)
-        B_new = self.B_prev + self.eta * (R_t**2 - self.B_prev)
+        # === 2. Coût de transaction (pénalise le churning) ===
+        reward -= 0.01 * position_change
 
-        denom = (B_new - A_new**2) ** 1.5 + 1e-12
-        if abs(denom) > 1e-10:
-            dsr = (B_new * (R_t - A_new) - 0.5 * A_new * (R_t**2 - B_new)) / denom
-        else:
-            dsr = R_t
-
-        self.A_prev = A_new
-        self.B_prev = B_new
-
-        reward += float(np.clip(dsr * 10, -2.0, 2.0))  # réduit de ×100 à ×10, clip ±2
-
-        # === 3. CVaR — pénalité LÉGÈRE sur le tail risk ===
-        if len(self.returns_history) >= 20:
-            returns_arr = np.array(self.returns_history[-100:])
-            var_threshold = np.percentile(returns_arr, self.cvar_alpha * 100)
-            tail_returns = returns_arr[returns_arr <= var_threshold]
-            if len(tail_returns) > 0:
-                cvar = np.mean(tail_returns)
-                # Pénalité douce : lambda × cvar × 5 (réduit de ×50 à ×5)
-                reward += self.cvar_lambda * cvar * 5
-
-        # === 4. Pénalité de turnover (réduite) ===
-        turnover_penalty = -0.02 * position_change  # réduit de 0.08 à 0.02
-        reward += turnover_penalty
-
-        # === 5. Pénalité de drawdown (seuils relevés) ===
-        if self.peak_balance > 0:
-            dd = (self.balance - self.peak_balance) / self.peak_balance
-            if dd < -0.10:  # seuil relevé de -5% à -10%
-                reward += dd * 1.0  # réduit de 3.0 à 1.0
-            if dd < -0.20:  # seuil relevé de -15% à -20%
-                reward -= 1.0  # réduit de 2.0 à 1.0
-
-        # === 6. Holding bonus (encourage à garder les positions gagnantes) ===
-        if self.time_in_position > 3 and R_t * self.position > 0:
-            reward += 0.15 * min(self.time_in_position / 20, 1.0)
-
-        # === 7. Pénalité d'INACTION (nouveau — force l'agent à trader) ===
+        # === 3. Pénalité d'inaction (force l'agent à prendre position) ===
         if abs(self.position) < 0.05:
-            reward -= 0.1  # petite pénalité constante pour rester flat
+            reward -= 0.05
 
-        return float(np.clip(reward, -10.0, 10.0))
+        # === 4. Bonus de holding gagnant ===
+        if self.time_in_position > 5 and self.position * market_return > 0:
+            reward += 0.05
+
+        return float(np.clip(reward, -5.0, 5.0))
 
     def render(self, mode="human"):
         dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
