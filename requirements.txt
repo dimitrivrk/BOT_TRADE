@@ -1,0 +1,65 @@
+# =============================================================================
+# DÉPENDANCES - Bot de Trading IA Crypto
+# =============================================================================
+
+# --- Exchange & Data ---
+ccxt==4.3.80
+ccxt[async]                  # pour le WebSocket async
+
+# --- Data Processing ---
+pandas>=2.1.0
+numpy>=1.26.0
+pandas-ta>=0.4.0             # indicateurs techniques
+pyarrow>=14.0.0              # format parquet pour la persistence
+
+# --- Deep Learning ---
+torch>=2.1.0
+torchvision>=0.16.0
+pytorch-lightning>=2.1.0
+
+# --- TFT ---
+pytorch-forecasting>=1.0.0   # Temporal Fusion Transformer
+
+# --- Reinforcement Learning ---
+stable-baselines3>=2.2.0
+gymnasium>=0.29.0            # environnements Gym
+sb3-contrib>=2.2.0           # algos supplémentaires (TQC, etc.)
+shimmy>=1.3.0                # compatibilité gym/gymnasium
+
+# --- Backtesting ---
+vectorbt>=0.25.5
+ta-lib>=0.4.28               # optionnel, pour les indicateurs TA-Lib C
+
+# --- Hyperparameter Optimization ---
+optuna>=3.4.0
+ray[tune]>=2.8.0             # tuning distribué (compatible Python 3.12)
+
+# --- Visualisation ---
+plotly>=5.18.0
+dash>=2.14.0                 # dashboard temps réel
+dash-bootstrap-components>=1.5.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# --- Monitoring ---
+tensorboard>=2.15.0
+rich>=13.7.0                 # affichage console amélioré
+tqdm>=4.66.0
+
+# --- Configuration & Utils ---
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+click>=8.1.7
+schedule>=1.2.0              # tâches planifiées
+
+# --- Alertes (optionnel) ---
+# python-telegram-bot>=20.7  # décommenter si tu veux les alertes Telegram
+# discord.py>=2.3.2          # décommenter si tu veux les alertes Discord
+
+# --- Base de données ---
+sqlalchemy>=2.0.25           # ORM
+# psycopg2-binary>=2.9.9     # décommenter si tu utilises PostgreSQL
+aiofiles>=23.2.1             # I/O async
+
+# --- Sécurité ---
+cryptography>=41.0.7

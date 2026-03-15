@@ -1,0 +1,44 @@
+# Modèles et checkpoints (trop lourds pour GitHub)
+checkpoints/
+*.zip
+*.pt
+*.ckpt
+*.pkl
+*.pth
+
+# Données
+data/storage/
+data/raw/
+data/processed/
+*.parquet
+*.feather
+*.h5
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environnement
+venv/
+.env
+*.env
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

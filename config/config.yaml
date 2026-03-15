@@ -1,0 +1,194 @@
+# =============================================================================
+# BOT TRADING CONFIG - CRYPTO AI BOT
+# =============================================================================
+
+exchange:
+  name: "binance"          # binance | bybit | kraken | okx
+  sandbox: true            # true = testnet (IMPORTANT: mettre false en prod)
+  rate_limit: true
+  timeout: 30000
+
+trading:
+  pairs:
+    - "BTC/USDT"
+    - "ETH/USDT"
+    - "SOL/USDT"
+    - "BNB/USDT"
+  base_currency: "USDT"
+  timeframes:
+    primary: "1h"          # timeframe principal pour les signaux
+    higher: "4h"           # confirmation higher timeframe
+    lower: "15m"           # entrée précise lower timeframe
+  market_type: "futures"   # spot | futures
+  leverage: 3              # levier max (1 = pas de levier)
+
+capital:
+  total_usdt: 10000.0
+  max_position_pct: 0.15   # 15% max par position
+  max_drawdown_pct: 0.20   # stoppe le bot si DD > 20%
+  risk_per_trade_pct: 0.01 # risque 1% du capital par trade (Kelly)
+
+data:
+  historical_days: 730     # 2 ans d'historique
+  warmup_candles: 200      # bougies de chauffe indicateurs
+  storage: "sqlite"        # sqlite | postgresql | timescaledb
+  db_path: "data/storage/market_data.db"
+  cache_dir: "data/cache"
+
+features:
+  # Indicateurs techniques
+  indicators:
+    trend:
+      - name: "EMA"
+        periods: [9, 21, 50, 200]
+      - name: "SMA"
+        periods: [20, 50]
+      - name: "VWAP"
+      - name: "SuperTrend"
+        atr_period: 10
+        multiplier: 3.0
+    momentum:
+      - name: "RSI"
+        period: 14
+      - name: "MACD"
+        fast: 12
+        slow: 26
+        signal: 9
+      - name: "Stochastic"
+        k: 14
+        d: 3
+      - name: "MFI"
+        period: 14
+    volatility:
+      - name: "BollingerBands"
+        period: 20
+        std: 2.0
+      - name: "ATR"
+        period: 14
+      - name: "KeltnerChannels"
+        period: 20
+    volume:
+      - name: "OBV"
+      - name: "VWMA"
+        period: 20
+      - name: "CMF"
+        period: 20
+    patterns:
+      - name: "CandlePatterns"   # doji, hammer, engulfing...
+
+  # Features avancées
+  advanced:
+    orderbook_depth: 10          # niveaux de carnet d'ordres
+    funding_rate: true           # taux de financement futures
+    open_interest: true          # intérêt ouvert
+    liquidations: true           # données de liquidations
+    fear_greed_index: true       # indice peur/cupidité
+
+  # Fenêtres temporelles pour les features
+  lookback_windows: [5, 10, 20, 50, 100]
+
+  # Normalisation
+  normalization: "rolling_zscore" # rolling_zscore | minmax | robust
+
+models:
+  # --- Temporal Fusion Transformer ---
+  tft:
+    enabled: true
+    hidden_size: 64           # 256 en prod (GPU) — 64 pour CPU rapide
+    lstm_layers: 1            # 2 en prod — 1 pour CPU
+    num_attention_heads: 4    # 8 en prod — 4 pour CPU
+    dropout: 0.1
+    horizon: 6                # prédire 6 pas en avant (6h)
+    encoder_steps: 168        # fenêtre d'encodage (1 semaine en 1h)
+    batch_size: 128           # plus grand batch = moins de steps/epoch
+    max_epochs: 30            # 100 en prod — 30 pour valider le pipeline
+    learning_rate: 1e-3
+    scheduler: "cosine"
+    gradient_clip: 1.0
+    checkpoint_dir: "checkpoints/tft"
+
+  # --- Reinforcement Learning (SAC) ---
+  rl:
+    enabled: true
+    algorithm: "SAC"           # SAC (recommande) | PPO
+    policy: "MlpPolicy"
+    # SAC params
+    buffer_size: 500000        # replay buffer (off-policy)
+    learning_starts: 5000      # steps avant de commencer a apprendre
+    batch_size: 256
+    tau: 0.005                 # soft update du target network
+    # PPO fallback params
+    n_steps: 1024              # reduit vs 2048 pour updates plus stables
+    n_epochs: 10
+    gae_lambda: 0.95
+    clip_range: 0.2
+    ent_coef: 0.01
+    target_kl: 0.02            # NOUVEAU: stoppe les updates si KL > 0.02
+    # Commun
+    learning_rate: 1e-4        # 3x plus bas que avant (plus stable)
+    gamma: 0.99
+    total_timesteps: 500000    # 500k suffisent avec SAC (plus efficient)
+    checkpoint_dir: "checkpoints/rl"
+    env:
+      initial_balance: 10000
+      max_position_pct: 0.5
+      transaction_cost: 0.001
+      reward_type: "differential_sharpe"  # NOUVEAU: DSR au lieu de sharpe rolling
+
+  # --- Ensemble ---
+  ensemble:
+    enabled: true
+    method: "weighted"         # weighted | voting
+    tft_weight: 0.45
+    rl_weight: 0.35
+    technical_weight: 0.20
+    confidence_threshold: 0.25  # seuil de confiance pour trader
+
+backtesting:
+  engine: "vectorbt"
+  start_date: "2023-01-01"
+  end_date: "2024-12-31"
+  initial_capital: 10000.0
+  commission: 0.001          # 0.1%
+  slippage: 0.0005           # 0.05%
+  metrics:
+    - "total_return"
+    - "sharpe_ratio"
+    - "sortino_ratio"
+    - "max_drawdown"
+    - "calmar_ratio"
+    - "win_rate"
+    - "profit_factor"
+    - "expectancy"
+  walk_forward:
+    enabled: true
+    train_months: 6
+    test_months: 1
+
+risk:
+  # Stop Loss / Take Profit dynamiques (ATR-based)
+  stop_loss:
+    method: "atr"            # atr | fixed | trailing | none
+    atr_multiplier: 2.0
+  take_profit:
+    method: "rr_ratio"       # rr_ratio | atr | none
+    rr_ratio: 2.5            # risk/reward ratio
+
+  # Gestion du portefeuille
+  position_sizing: "kelly"   # kelly | fixed | volatility_parity
+  kelly_fraction: 0.25       # Kelly fractionné (sécurité)
+
+  # Circuit breakers
+  max_consecutive_losses: 5
+  daily_loss_limit_pct: 0.05
+
+logging:
+  level: "DEBUG"              # DEBUG | INFO | WARNING | ERROR
+  file: "logs/bot.log"
+  max_size_mb: 100
+  backup_count: 10
+
+monitoring:
+  dashboard_port: 8050       # port Dash
+  telegram_alerts: false     # mettre true si token configuré
+  discord_alerts: false
