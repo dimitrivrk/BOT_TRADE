@@ -357,9 +357,9 @@ class SSMFeaturesExtractor(BaseFeaturesExtractor):
 
         # Multi-scale convolutions (B, T, C) → (B, C, T)
         x_t = x.transpose(1, 2)
-        c_short = torch.silu(self.conv_short(x_t))   # (B, 64, T)
-        c_med = torch.silu(self.conv_med(x_t))       # (B, 64, T)
-        c_long = torch.silu(self.conv_long(x_t))     # (B, 64, T)
+        c_short = torch.nn.functional.silu(self.conv_short(x_t))   # (B, 64, T)
+        c_med = torch.nn.functional.silu(self.conv_med(x_t))       # (B, 64, T)
+        c_long = torch.nn.functional.silu(self.conv_long(x_t))     # (B, 64, T)
 
         # Concat multi-scale → (B, 192, T)
         multi = torch.cat([c_short, c_med, c_long], dim=1)
