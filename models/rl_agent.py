@@ -301,13 +301,39 @@ class CryptoTradingEnv(gym.Env):
 
 
 # =============================================================================
-# FEATURE EXTRACTOR SSM-INSPIRED
+# FEATURE EXTRACTORS
 # =============================================================================
+
+class MLPFeaturesExtractor(BaseFeaturesExtractor):
+    """
+    Feature extractor MLP simple et RAPIDE.
+    Flatten l'observation + 3 couches denses. ~5x plus rapide que Conv1D.
+    Parfait pour un premier run rapide.
+    """
+
+    def __init__(self, observation_space: spaces.Box, lookback: int = 10,
+                 n_extra: int = 4, features_dim: int = 128):
+        super().__init__(observation_space, features_dim=features_dim)
+
+        n_total = observation_space.shape[0]
+
+        self.net = nn.Sequential(
+            nn.Linear(n_total, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs)
+
 
 class SSMFeaturesExtractor(BaseFeaturesExtractor):
     """
-    Feature extractor SSM-inspired (léger) pour capturer les dépendances temporelles.
-    Utilise Conv1D + Gating au lieu du Transformer (plus rapide pour le RL).
+    Feature extractor SSM-inspired (précis) pour capturer les dépendances temporelles.
+    Utilise Conv1D + Gating. Plus lent mais meilleur résultat.
     """
 
     def __init__(self, observation_space: spaces.Box, lookback: int = 20,
@@ -446,9 +472,15 @@ class RLTradingAgent:
         val_feat = val_features_df if val_features_df is not None else features_df.iloc[split:]
         val_prices = val_prices_df if val_prices_df is not None else prices_df.iloc[split:]
 
-        lookback = self.cfg.get("lookback", 20)
-        total_timesteps = self.cfg.get("total_timesteps", 500_000)
+        lookback = self.cfg.get("lookback", 10)
+        total_timesteps = self.cfg.get("total_timesteps", 100_000)
         lr = float(self.cfg["learning_rate"])
+        eval_freq = self.cfg.get("eval_freq", 20000)
+        n_eval_episodes = self.cfg.get("n_eval_episodes", 1)
+        fe_type = self.cfg.get("feature_extractor", "mlp")
+
+        logger.info(f"Config: {total_timesteps:,} steps | lookback={lookback} | "
+                     f"lr={lr} | extractor={fe_type} | agents={self.agent_names}")
 
         # Entraîner chaque agent de l'ensemble
         for algo_name in self.agent_names:
@@ -464,22 +496,27 @@ class RLTradingAgent:
             val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val")])
             val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
 
-            # Feature extractor kwargs
+            # Feature extractor : MLP (rapide) ou SSM (précis)
             n_extra = 4
-            fe_kwargs = dict(lookback=lookback, n_extra=n_extra, features_dim=256)
+            if fe_type == "mlp":
+                fe_class = MLPFeaturesExtractor
+                fe_kwargs = dict(lookback=lookback, n_extra=n_extra, features_dim=128)
+            else:
+                fe_class = SSMFeaturesExtractor
+                fe_kwargs = dict(lookback=lookback, n_extra=n_extra, features_dim=256)
 
             # Checkpoint dir spécifique à l'algo
             algo_ckpt = self.checkpoint_dir / algo_name.lower()
             algo_ckpt.mkdir(parents=True, exist_ok=True)
 
-            # Callbacks
+            # Callbacks (eval moins fréquente = plus rapide)
             callbacks = [
                 EvalCallback(
                     val_env,
                     best_model_save_path=str(algo_ckpt),
                     log_path=str(algo_ckpt / "logs"),
-                    eval_freq=5000,
-                    n_eval_episodes=3,
+                    eval_freq=eval_freq,
+                    n_eval_episodes=n_eval_episodes,
                     deterministic=True,
                 ),
                 CheckpointCallback(
@@ -490,7 +527,7 @@ class RLTradingAgent:
             ]
 
             # Créer le modèle selon l'algo
-            model = self._create_model(algo_name, env, lr, lookback, n_extra, fe_kwargs)
+            model = self._create_model(algo_name, env, lr, lookback, n_extra, fe_kwargs, fe_class)
 
             logger.info(f"Entraînement {algo_name} : {total_timesteps:,} timesteps | lr={lr}")
 
@@ -515,12 +552,14 @@ class RLTradingAgent:
         logger.info(f"Ensemble entraîné : {list(self.models.keys())}")
         return self.models
 
-    def _create_model(self, algo_name, env, lr, lookback, n_extra, fe_kwargs):
+    def _create_model(self, algo_name, env, lr, lookback, n_extra, fe_kwargs, fe_class=None):
         """Crée un modèle SB3 selon le nom de l'algorithme."""
+        if fe_class is None:
+            fe_class = MLPFeaturesExtractor
 
         if algo_name == "SAC":
             policy_kwargs = dict(
-                features_extractor_class=SSMFeaturesExtractor,
+                features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
                 net_arch=[256, 128],
                 activation_fn=nn.ReLU,
@@ -545,7 +584,7 @@ class RLTradingAgent:
 
         elif algo_name == "PPO":
             policy_kwargs = dict(
-                features_extractor_class=SSMFeaturesExtractor,
+                features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
                 net_arch=dict(pi=[256, 128], vf=[256, 128]),
                 activation_fn=nn.ReLU,
@@ -575,7 +614,7 @@ class RLTradingAgent:
                 sigma=0.2 * np.ones(n_actions),
             )
             policy_kwargs = dict(
-                features_extractor_class=SSMFeaturesExtractor,
+                features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
                 net_arch=[256, 128],
                 activation_fn=nn.ReLU,

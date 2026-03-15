@@ -122,26 +122,29 @@ models:
     enabled: true
     # Ensemble : entrainer les 3 agents (ou un sous-ensemble)
     ensemble_agents:
-      - "SAC"              # Meilleur en haute volatilite
-      - "PPO"              # Le plus stable et robuste
-      - "DDPG"             # Le plus rapide, bon pour trends clairs
+      - "SAC"              # Commencer par SAC seul (ajouter PPO+DDPG apres)
+      # - "PPO"            # Activer pour l'ensemble complet
+      # - "DDPG"           # Activer pour l'ensemble complet
     # Params communs
-    learning_rate: 1e-4
+    learning_rate: 3e-4    # lr plus elevee = converge plus vite
     gamma: 0.99
-    buffer_size: 500000
-    learning_starts: 5000
+    buffer_size: 100000    # buffer reduit (suffisant pour 100k steps)
+    learning_starts: 2000  # commence a apprendre plus tot
     tau: 0.005
-    total_timesteps: 500000
-    lookback: 20           # fenetre d'observation RL
+    total_timesteps: 100000  # ~28 min a 60fps → premier resultat rapide
+    lookback: 10             # fenetre reduite = obs plus petite = plus rapide
     checkpoint_dir: "checkpoints/rl"
+    eval_freq: 20000         # eval toutes les 20k steps (pas 5k)
+    n_eval_episodes: 1       # 1 seul episode d'eval (pas 3)
+    feature_extractor: "mlp" # mlp = rapide, ssm = precis mais lent
     env:
       initial_balance: 10000
       max_position_pct: 0.5
       transaction_cost: 0.001
       reward_type: "risk_aware"
-      lookback: 20
-      cvar_alpha: 0.05     # 5% tail risk pour CVaR
-      cvar_lambda: 0.5     # poids de la penalite CVaR
+      lookback: 10           # doit matcher le lookback du RL
+      cvar_alpha: 0.05       # 5% tail risk pour CVaR
+      cvar_lambda: 0.5       # poids de la penalite CVaR
 
   # --- Feature Selection (XGBoost) ---
   feature_selection:
