@@ -63,7 +63,7 @@ class CryptoTradingEnv(gym.Env):
         self.returns = np.diff(np.log(self.prices))  # log returns
 
         self.n_features = self.features.shape[1]
-        self.lookback = 50
+        self.lookback = config.get("lookback", 20)  # 20 au lieu de 50 → obs 1680 vs 4200
         self.mode = mode
 
         # Config
@@ -405,7 +405,7 @@ class RLTradingAgent:
                 tau=float(self.cfg.get("tau", 0.005)),
                 gamma=float(self.cfg.get("gamma", 0.99)),
                 train_freq=4,         # update tous les 4 steps (au lieu de 1)
-                gradient_steps=4,     # 4 gradient steps par update
+                gradient_steps=1,     # 1 gradient step par update → 4x moins de compute
                 ent_coef="auto",
                 target_entropy="auto",
                 policy_kwargs=sac_policy_kwargs,
