@@ -401,10 +401,12 @@ class RLTradingAgent:
                 learning_rate=lr,
                 buffer_size=int(self.cfg.get("buffer_size", 500_000)),
                 learning_starts=int(self.cfg.get("learning_starts", 5000)),
-                batch_size=self.cfg.get("batch_size", 256),
+                batch_size=self.cfg.get("batch_size", 512),
                 tau=float(self.cfg.get("tau", 0.005)),
                 gamma=float(self.cfg.get("gamma", 0.99)),
-                ent_coef="auto",  # auto-tune de l'entropie
+                train_freq=4,         # update tous les 4 steps (au lieu de 1)
+                gradient_steps=4,     # 4 gradient steps par update
+                ent_coef="auto",
                 target_entropy="auto",
                 policy_kwargs=sac_policy_kwargs,
                 verbose=1,
