@@ -352,7 +352,7 @@ class RLTradingAgent:
         self.vec_env = env
 
         # Feature extractor
-        lookback = 50
+        lookback = self.cfg.get("lookback", 20)
         policy_kwargs = dict(
             features_extractor_class=TransformerFeaturesExtractor,
             features_extractor_kwargs=dict(lookback=lookback, features_dim=256),
@@ -461,7 +461,7 @@ class RLTradingAgent:
 
         # Ajuster features pour matcher le modèle entraîné
         expected_obs_size = self.model.observation_space.shape[0]
-        lookback = 50
+        lookback = self.cfg.get("lookback", 20)
         expected_n_features = expected_obs_size // lookback
         if features_df.shape[1] > expected_n_features:
             features_df = features_df.iloc[:, :expected_n_features]
@@ -470,8 +470,8 @@ class RLTradingAgent:
 
         # Env temporaire pour l'inférence
         env = CryptoTradingEnv(
-            features_df.tail(100 + 50),
-            prices_df.tail(100 + 50),
+            features_df.tail(100 + lookback),
+            prices_df.tail(100 + lookback),
             self.env_cfg,
             mode="inference",
         )
