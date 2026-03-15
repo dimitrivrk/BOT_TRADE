@@ -293,43 +293,28 @@ class BacktestEngine:
     ) -> vbt.Portfolio:
         """
         Lance la simulation vectorbt.
-        On sépare long et short en deux portfolios puis on les combine,
-        car vectorbt SizeType.Percent ne supporte pas les reversals directs.
+        Utilise from_signals avec direction="both" pour gérer long + short
+        dans un seul portfolio (évite les problèmes de combinaison).
         """
         close = df['close']
         freq = self._infer_freq(df)
 
-        # Taille fixe par trade (fraction du capital)
-        size_val = self.initial_capital * 0.95  # 95% du capital par trade
+        # Taille par trade : fraction du capital
+        size_val = self.initial_capital * 0.95
 
-        entries      = signals['entry_long'].fillna(False).astype(bool)
-        exits        = signals['exit_long'].fillna(False).astype(bool)
+        entries       = signals['entry_long'].fillna(False).astype(bool)
+        exits         = signals['exit_long'].fillna(False).astype(bool)
         short_entries = signals['entry_short'].fillna(False).astype(bool) if 'entry_short' in signals.columns else pd.Series(False, index=close.index)
         short_exits   = signals['exit_short'].fillna(False).astype(bool) if 'exit_short' in signals.columns else pd.Series(False, index=close.index)
 
-        # --- Portfolio LONG ---
-        pf_long = vbt.Portfolio.from_signals(
-            close=close,
-            entries=entries,
-            exits=exits,
-            size=size_val,
-            size_type="value",
-            init_cash=self.initial_capital,
-            fees=self.commission,
-            slippage=self.slippage,
-            sl_stop=sl_pct,
-            tp_stop=tp_pct,
-            freq=freq,
-            accumulate=False,
-        )
-
-        # --- Portfolio SHORT ---
         has_shorts = short_entries.any()
+
         if has_shorts:
-            pf_short = vbt.Portfolio.from_signals(
+            # Portfolio combiné long + short
+            pf = vbt.Portfolio.from_signals(
                 close=close,
-                entries=short_entries,
-                exits=short_exits,
+                entries=entries,
+                exits=exits,
                 short_entries=short_entries,
                 short_exits=short_exits,
                 size=size_val,
@@ -341,13 +326,25 @@ class BacktestEngine:
                 tp_stop=tp_pct,
                 freq=freq,
                 accumulate=False,
-                direction="shortonly",
             )
-            # Retourner le long (le plus simple pour le baseline)
-            # TODO : combiner les deux equity curves pour une stratégie complète
-            return pf_long
         else:
-            return pf_long
+            # Long only
+            pf = vbt.Portfolio.from_signals(
+                close=close,
+                entries=entries,
+                exits=exits,
+                size=size_val,
+                size_type="value",
+                init_cash=self.initial_capital,
+                fees=self.commission,
+                slippage=self.slippage,
+                sl_stop=sl_pct,
+                tp_stop=tp_pct,
+                freq=freq,
+                accumulate=False,
+            )
+
+        return pf
 
     def _infer_freq(self, df: pd.DataFrame) -> str:
         """Infère la fréquence du DataFrame."""

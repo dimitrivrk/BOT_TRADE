@@ -632,7 +632,11 @@ class RLTradingAgent:
     ) -> Dict[str, float]:
         """
         Génère un signal de trading via ensemble vote.
-        Chaque agent vote, le signal final est la moyenne pondérée.
+
+        Fix v3.3 :
+        - Charge VecNormalize pour normaliser les obs comme pendant le training
+        - Construit l'observation directement (pas de simulation 80 steps)
+        - Chaque agent reçoit la MÊME observation normalisée
         """
         # Charger les modèles si nécessaire
         if not self.models:
@@ -641,7 +645,7 @@ class RLTradingAgent:
         lookback = self.cfg.get("lookback", 20)
         n_extra = 4
 
-        # Ajuster features
+        # Ajuster le nombre de features pour matcher le modèle
         if self.models:
             first_model = next(iter(self.models.values()))
             expected_obs_size = first_model.observation_space.shape[0]
@@ -649,30 +653,60 @@ class RLTradingAgent:
             if features_df.shape[1] > expected_n_features:
                 features_df = features_df.iloc[:, :expected_n_features]
 
-        # Env temporaire pour l'inférence
-        env = CryptoTradingEnv(
-            features_df.tail(100 + lookback),
-            prices_df.tail(100 + lookback),
-            self.env_cfg,
-            mode="inference",
-        )
+        # --- Construire l'observation directement (comme dans CryptoTradingEnv._get_observation) ---
+        if len(features_df) < lookback:
+            return {"direction": 0, "confidence": 0.0, "position": 0.0, "model": "rl_ensemble"}
+
+        # Dernières `lookback` lignes de features
+        feat_window = features_df.iloc[-lookback:].values.astype(np.float32)
+        feat_window = np.nan_to_num(feat_window, nan=0.0, posinf=5.0, neginf=-5.0)
+        flat = feat_window.flatten()
+
+        # Features augmentées (valeurs neutres pour l'inférence ponctuelle)
+        # position=0, drawdown=0, vol=estimée, time_in_pos=0
+        if len(prices_df) >= 20:
+            recent_returns = np.diff(np.log(prices_df['close'].values[-21:].astype(np.float64)))
+            recent_vol = float(np.std(recent_returns)) if len(recent_returns) > 1 else 0.0
+        else:
+            recent_vol = 0.0
+
+        extras = np.array([
+            0.0,                                        # position neutre
+            0.0,                                        # pas de drawdown
+            np.clip(recent_vol * 100, 0.0, 5.0),       # volatilité réalisée
+            0.0,                                        # pas de temps dans position
+        ], dtype=np.float32)
+
+        raw_obs = np.concatenate([flat, extras]).astype(np.float32)
 
         # Collecter les prédictions de chaque agent
         agent_predictions = {}
 
         for algo_name, model in self.models.items():
             try:
-                obs, _ = env.reset()
-                # Avancer jusqu'au dernier step
-                for _ in range(min(80, len(features_df) - lookback - 10)):
-                    action, _ = model.predict(obs, deterministic=deterministic)
-                    obs, _, done, _, _ = env.step(action)
-                    if done:
-                        obs, _ = env.reset()
+                # Charger VecNormalize si disponible (CRITIQUE pour matching le training)
+                obs = raw_obs.copy()
+                vec_norm_path = self.checkpoint_dir / algo_name.lower() / "vec_normalize.pkl"
+                if vec_norm_path.exists():
+                    try:
+                        vec_norm = VecNormalize.load(str(vec_norm_path), DummyVecEnv([
+                            lambda: CryptoTradingEnv(
+                                features_df.tail(lookback + 10),
+                                prices_df.tail(lookback + 10),
+                                self.env_cfg, mode="inference"
+                            )
+                        ]))
+                        vec_norm.training = False
+                        vec_norm.norm_reward = False
+                        # Normaliser l'observation
+                        obs = vec_norm.normalize_obs(obs)
+                    except Exception as e:
+                        logger.warning(f"VecNormalize load failed pour {algo_name}: {e}")
 
-                # Dernière action
-                final_action, _ = model.predict(obs, deterministic=deterministic)
-                position = float(np.clip(final_action[0], -1.0, 1.0))
+                # Prédire directement sur l'observation courante
+                obs_tensor = np.expand_dims(obs, 0) if obs.ndim == 1 else obs
+                action, _ = model.predict(obs_tensor, deterministic=deterministic)
+                position = float(np.clip(action[0], -1.0, 1.0))
                 agent_predictions[algo_name] = position
 
             except Exception as e:
