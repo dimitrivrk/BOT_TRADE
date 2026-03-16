@@ -7,13 +7,13 @@ checkpoints/
 *.pth
 
 # Données (fichiers binaires/DB uniquement, pas le code)
-data/storage/*.db
-data/storage/.fuse_hidden*
-data/raw/
-data/processed/
-*.parquet
-*.feather
-*.h5
+# data/storage/*.db
+# data/storage/.fuse_hidden*
+# data/raw/
+# data/processed/
+# *.parquet
+# *.feather
+# *.h5
 
 # Python
 __pycache__/
