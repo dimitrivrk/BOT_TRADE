@@ -124,13 +124,15 @@ class HistoricalDataCollector:
             last_ts = self.db.get_last_timestamp(symbol, timeframe)
             target_start_ms = now_ms - (days * 24 * 3600 * 1000)
 
-            if last_ts and not force_full and last_ts < now_ms - tf_ms * 2:
-                # Reprendre seulement si le dernier timestamp est suffisamment dans le passé
+            if last_ts and not force_full and last_ts >= target_start_ms:
+                # DB a deja les donnees recentes -> telecharger seulement les nouvelles bougies
                 since_ms = last_ts + tf_ms
-                logger.info(f"{symbol}/{timeframe} : reprise depuis {pd.Timestamp(since_ms, unit='ms')}")
+                nb_missing = max(0, (now_ms - since_ms) // tf_ms)
+                last_dt = pd.Timestamp(last_ts, unit='ms').strftime('%Y-%m-%d %H:%M UTC')
+                logger.info(f"{symbol}/{timeframe} : DB a jour jusqu'au {last_dt} | {nb_missing} bougies manquantes")
             else:
                 since_ms = target_start_ms
-                logger.info(f"{symbol}/{timeframe} : téléchargement complet depuis {pd.Timestamp(since_ms, unit='ms')}")
+                logger.info(f"{symbol}/{timeframe} : telechargement complet depuis {pd.Timestamp(since_ms, unit='ms')}")
 
         all_candles = []
         batch_size = 1000  # max Binance
@@ -169,7 +171,7 @@ class HistoricalDataCollector:
                 break
 
         if not all_candles:
-            logger.warning(f"Aucune donnée pour {symbol}/{timeframe}")
+            logger.info(f"{symbol}/{timeframe} : deja a jour, rien a telecharger")
             return pd.DataFrame()
 
         df = self._candles_to_df(all_candles)

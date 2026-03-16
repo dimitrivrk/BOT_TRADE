@@ -20,6 +20,7 @@ import asyncio
 import argparse
 import signal
 import sys
+import pandas as pd
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -93,6 +94,7 @@ def run_train(args):
     pairs = args.pairs or config["trading"]["pairs"]
     tf = config["trading"]["timeframes"]["primary"]
     tf_higher = config["trading"]["timeframes"]["higher"]
+    tf_lower = config["trading"]["timeframes"].get("lower")
 
     for symbol in pairs:
         logger.info(f"Entrainement modeles pour {symbol}...")
@@ -100,14 +102,20 @@ def run_train(args):
         # Charger les donnees
         df = collector.load_data(symbol, tf)
         df_higher = collector.load_data(symbol, tf_higher)
+        df_lower = pd.DataFrame()
+        if tf_lower:
+            df_lower = collector.load_data(symbol, tf_lower)
 
         if len(df) < 500:
             logger.warning(f"Donnees insuffisantes pour {symbol}, skip.")
             continue
 
-        # Features
+        # Features (avec on-chain + lower TF si dispo)
         features = feature_eng.compute_all(
-            df, higher_tf_df=df_higher if not df_higher.empty else None
+            df,
+            higher_tf_df=df_higher if not df_higher.empty else None,
+            lower_tf_df=df_lower if not df_lower.empty else None,
+            symbol=symbol,
         )
         logger.info(f"Features : {features.shape[1]} colonnes, {len(features)} lignes")
 
@@ -132,7 +140,7 @@ def run_train(args):
                 try:
                     from models.crypto_mamba import MambaPredictor
                     mamba = MambaPredictor()
-                    mamba.train(selected_features, df, symbol)
+                    mamba.train(selected_features, df[['close']], symbol)
                     logger.info(f"CryptoMamba entraine pour {symbol}")
                 except Exception as e:
                     logger.error(f"CryptoMamba training failed : {e}")
@@ -197,21 +205,19 @@ async def run_live(args):
     from strategies.ml_strategy import MLTradingStrategy
 
     strategy = MLTradingStrategy()
-    loop = asyncio.get_event_loop()
-
-    def shutdown(sig, frame):
-        logger.info(f"Signal {sig} recu, arret en cours...")
-        strategy.stop()
-        loop.stop()
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
 
     logger.info("=== BOT DE TRADING IA v3 DEMARRE ===")
     logger.info("Architecture : CryptoMamba + RL Ensemble (SAC+PPO+DDPG)")
     logger.info("Ctrl+C pour arreter proprement")
 
-    await strategy.run()
+    try:
+        await strategy.run()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        logger.info("Arret en cours...")
+        strategy.stop()
+        await asyncio.sleep(2)  # laisser Discord envoyer la notif d'arret
 
 
 # =============================================================================

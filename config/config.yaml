@@ -1,9 +1,24 @@
 # =============================================================================
-# BOT TRADING CONFIG v3 — CRYPTO AI BOT (State of the Art 2025)
+# BOT TRADING CONFIG v4 - CRYPTO AI BOT (State of the Art 2025-2026)
+# Nouveautes v4:
+#   - Reward RL multi-objectif (DSR + drawdown + CVaR)
+#   - Env RL avec 10 portfolio state features
+#   - On-chain features (funding rate, OI, Fear&Greed, taker ratio)
+#   - Predictions multi-horizon Mamba pour SL/TP dynamiques
+#   - Meta-learner adaptatif pour les poids de l'ensemble
+#   - Trailing stop + partial TP + regime-adaptive SL/TP
 # =============================================================================
 
+# =============================================================================
+# DISCORD NOTIFICATIONS
+# =============================================================================
+discord:
+  webhook_url: "https://discord.com/api/webhooks/1482817674852565272/FccpSX6u9HV3XcXidJaduusud0tAbYuFYN_vVZP4t2-L8p4Zt4h2hJa64tq6ZSx2UxrU"
+  status_interval_minutes: 60      # status periodique toutes les X minutes
+
+# =============================================================================
 exchange:
-  name: "bybit"            # binance | bybit | kraken | okx
+  name: "binance"           # binance | bybit | kraken | okx
   sandbox: true            # true = testnet (IMPORTANT: mettre false en prod)
   rate_limit: true
   timeout: 30000
@@ -11,8 +26,6 @@ exchange:
 trading:
   pairs:
     - "BTC/USDT"
-    - "ETH/USDT"
-    - "SOL/USDT"
   base_currency: "USDT"
   timeframes:
     primary: "1h"          # timeframe principal pour les signaux
@@ -83,9 +96,10 @@ features:
 
   lookback_windows: [5, 10, 20, 50, 100]
   normalization: "rolling_zscore"
+  onchain_enabled: true          # features on-chain: funding rate, OI, Fear&Greed, etc.
 
 models:
-  # --- CryptoMamba (SSM — remplace TFT) ---
+  # --- CryptoMamba (SSM - remplace TFT) ---
   mamba:
     enabled: true
     d_model: 128          # dimension du modele SSM
@@ -134,8 +148,8 @@ models:
     total_timesteps: 500000  # 500k steps par agent
     lookback: 20             # fenetre complete
     checkpoint_dir: "checkpoints/rl"
-    n_envs: 24               # envs paralleles (SubprocVecEnv) — 24/31 vCPU, ~7 pour main+GPU+OS
-    eval_freq: 2000          # eval toutes les ~48k timesteps (2000 × 24 envs = 48k)
+    n_envs: 24               # envs paralleles (SubprocVecEnv)
+    eval_freq: 2000          # eval toutes les ~48k timesteps
     n_eval_episodes: 3       # 3 episodes d'eval
     feature_extractor: "ssm" # ssm = Conv1D multi-scale (precis)
     env:
@@ -145,7 +159,7 @@ models:
       reward_type: "risk_aware"
       lookback: 20           # doit matcher le lookback du RL
       cvar_alpha: 0.05       # 5% tail risk pour CVaR
-      cvar_lambda: 0.2       # poids de la penalite CVaR (reduit de 0.5 → 0.2)
+      cvar_lambda: 0.2       # poids de la penalite CVaR
 
   # --- Feature Selection (XGBoost) ---
   feature_selection:
@@ -155,11 +169,13 @@ models:
     correlation_threshold: 0.95  # supprimer features correlees > 95%
     cache_dir: "checkpoints/feature_selection"
 
-  # --- Ensemble (combine Mamba + RL + Technique) ---
+  # --- Ensemble v4 (Mamba + RL + Technique + Meta-learner) ---
+  # Apres entrainement Mamba: mettre mamba_weight a 0.35, rl_weight a 0.40
+  # Le meta-learner adaptatif overridera ces poids apres 5+ predictions
   ensemble:
     enabled: true
     method: "weighted"     # weighted | voting
-    mamba_weight: 0.00     # pas encore entraine → desactive pour l'instant
+    mamba_weight: 0.00     # 0 = Mamba pas entraine. Mettre 0.35 apres training
     rl_weight: 0.70        # RL Ensemble = signal principal
     technical_weight: 0.30 # signaux techniques = confirmation
     confidence_threshold: 0.65  # only take high-confidence trades
@@ -192,6 +208,37 @@ risk:
   take_profit:
     method: "rr_ratio"
     rr_ratio: 2.5
+  # Trailing stop : suit le prix en faveur, se declenche apres 1x RR de profit
+  trailing_stop:
+    enabled: true
+    activation_rr: 1.0          # active le trailing apres 1x RR de profit
+    atr_multiplier: 1.5         # trail a 1.5x ATR du plus haut/bas
+    step_pct: 0.002             # log quand le SL bouge de > 0.2%
+  # Partial take profit : ferme des fractions aux niveaux intermediaires
+  partial_take_profit:
+    enabled: true
+    levels:
+      - rr: 1.5                 # fermer 50% a 1.5x RR
+        close_pct: 0.50
+      - rr: 2.5                 # fermer 30% a 2.5x RR
+        close_pct: 0.30
+      # les 20% restants courent avec le trailing stop
+  # SL/TP adaptatifs selon le regime de marche detecte
+  regime_adaptation:
+    enabled: true
+    multipliers:
+      trending_bull:
+        sl_mult: 2.5            # SL large en tendance (laisser courir)
+        rr_ratio: 3.0           # TP genereux
+      trending_bear:
+        sl_mult: 2.5
+        rr_ratio: 3.0
+      ranging:
+        sl_mult: 1.5            # SL serre en range (capturer les rebounds)
+        rr_ratio: 2.0
+      volatile:
+        sl_mult: 3.0            # SL tres large en volatilite (eviter le bruit)
+        rr_ratio: 2.0
   position_sizing: "kelly"
   kelly_fraction: 0.25
   max_consecutive_losses: 5

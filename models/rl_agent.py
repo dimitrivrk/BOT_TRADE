@@ -78,8 +78,10 @@ class CryptoTradingEnv(gym.Env):
         self.A_prev = 0.0
         self.B_prev = 0.0
 
-        # Observation augmentée : features + [position, drawdown, volatilité réalisée, time_in_position]
-        n_extra = 4
+        # Observation augmentee : features + portfolio state enrichi
+        # 10 features augmentees vs 4 avant = meilleure conscience de l'etat
+        n_extra = 10
+        self.n_extra = n_extra
         obs_size = self.lookback * self.n_features + n_extra
         self.observation_space = spaces.Box(
             low=-5.0, high=5.0,
@@ -114,6 +116,11 @@ class CryptoTradingEnv(gym.Env):
         self.peak_balance = self.initial_balance
         self.time_in_position = 0
         self.prev_action_dir = 0
+        self.entry_price = 0.0
+        self.n_wins = 0
+        self.n_losses = 0
+        self.consecutive_wins = 0
+        self.consecutive_losses = 0
 
         # Reset DSR state
         self.A_prev = 0.0
@@ -128,14 +135,39 @@ class CryptoTradingEnv(gym.Env):
         obs = np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
         flat = obs.flatten().astype(np.float32)
 
-        # Features augmentées
+        # 10 portfolio state features (vs 4 avant)
         dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
         recent_vol = np.std(self.returns_history[-20:]) if len(self.returns_history) >= 20 else 0.0
+
+        # Unrealized PnL normalise
+        current_price = self.prices[min(self.current_step, len(self.prices) - 1)]
+        if self.position != 0 and self.entry_price > 0:
+            unrealized_pnl = (current_price - self.entry_price) / self.entry_price * np.sign(self.position)
+        else:
+            unrealized_pnl = 0.0
+
+        # Sharpe rolling (20 derniers steps)
+        if len(self.returns_history) >= 20:
+            recent = np.array(self.returns_history[-20:])
+            rolling_sharpe = np.mean(recent) / (np.std(recent) + 1e-8) * np.sqrt(24)
+        else:
+            rolling_sharpe = 0.0
+
+        # Win rate recente
+        total_trades = self.n_wins + self.n_losses
+        win_rate = self.n_wins / (total_trades + 1e-8) if total_trades > 0 else 0.5
+
         extras = np.array([
-            self.position,                              # position actuelle
-            np.clip(dd, -1.0, 0.0),                    # drawdown courant
-            np.clip(recent_vol * 100, 0.0, 5.0),       # volatilité réalisée
-            np.clip(self.time_in_position / 100, 0, 1), # temps dans la position
+            self.position,                                       # 1. position actuelle [-1, 1]
+            np.clip(dd, -1.0, 0.0),                              # 2. drawdown courant
+            np.clip(recent_vol * 100, 0.0, 5.0),                 # 3. volatilite realisee
+            np.clip(self.time_in_position / 50, 0, 1),           # 4. temps dans la position
+            np.clip(unrealized_pnl * 10, -5.0, 5.0),             # 5. PnL non realise
+            np.clip(rolling_sharpe, -3.0, 3.0),                  # 6. Sharpe rolling
+            np.clip(win_rate * 2 - 1, -1.0, 1.0),               # 7. win rate [-1, 1]
+            np.clip(self.consecutive_wins / 5, 0, 1),            # 8. streak gagnante
+            np.clip(self.consecutive_losses / 5, 0, 1),          # 9. streak perdante
+            np.clip((self.balance / self.initial_balance - 1) * 5, -5.0, 5.0),  # 10. total return
         ], dtype=np.float32)
 
         return np.concatenate([flat, extras])
@@ -162,12 +194,29 @@ class CryptoTradingEnv(gym.Env):
         # Track peak pour drawdown
         self.peak_balance = max(self.peak_balance, self.balance)
 
-        # Temps dans la même direction
+        # Temps dans la meme direction + tracking entry price
         current_dir = 1 if new_position > 0.1 else (-1 if new_position < -0.1 else 0)
         if current_dir == self.prev_action_dir and current_dir != 0:
             self.time_in_position += 1
         else:
+            # Direction change -> fermeture implicite du trade
+            if self.prev_action_dir != 0 and current_dir != self.prev_action_dir:
+                # Evaluer si le trade ferme etait gagnant ou perdant
+                if self.entry_price > 0:
+                    pnl_sign = (self.prices[min(self.current_step, len(self.prices)-1)] - self.entry_price) * self.prev_action_dir
+                    if pnl_sign > 0:
+                        self.n_wins += 1
+                        self.consecutive_wins += 1
+                        self.consecutive_losses = 0
+                    else:
+                        self.n_losses += 1
+                        self.consecutive_losses += 1
+                        self.consecutive_wins = 0
             self.time_in_position = 0
+            if current_dir != 0:
+                self.entry_price = float(self.prices[min(self.current_step, len(self.prices)-1)])
+            else:
+                self.entry_price = 0.0
         self.prev_action_dir = current_dir
 
         # Update position
@@ -206,35 +255,97 @@ class CryptoTradingEnv(gym.Env):
 
     def _compute_reward(self, position_change: float) -> float:
         """
-        Reward v3.2 — Simple et efficace.
+        Reward v4.0 -- Multi-objectif state-of-the-art 2025.
 
-        Signal principal : position × market_return (directement, pas le PnL portfolio).
-        Quand position = 0, le signal est TOUJOURS 0 → gradient clair pour l'agent.
-        Long et marché monte → positif. Short et marché baisse → positif.
+        Combine 5 composantes (recherche: arxiv 2506.04358, MDPI 2024):
+          1. Differential Sharpe Ratio (DSR) - risk-adjusted return incrementiel
+          2. Drawdown penalty - penalise les pertes en capital
+          3. Transaction costs - penalise le churning
+          4. CVaR tail risk penalty - penalise les queues de distribution
+          5. Holding bonus / conviction reward
+
+        Le DSR est superieur au simple return car il optimise le Sharpe directement,
+        ce qui force l'agent a chercher des trades a haut ratio rendement/risque.
         """
         if self.current_step < len(self.returns):
             market_return = self.returns[self.current_step - 1]
         else:
             market_return = 0.0
 
-        reward = 0.0
+        # Return du step actuel
+        step_return = self.position * market_return
 
-        # === 1. SIGNAL DIRECTIONNEL (95% de la reward) ===
-        # position ∈ [-1, 1], market_return ≈ ±0.001 pour 1h
-        # Scale ×500 → reward ≈ ±0.5 par step quand fully invested
-        directional = self.position * market_return * 500.0
-        reward += float(np.clip(directional, -3.0, 3.0))
+        # ===================================================================
+        # 1. DIFFERENTIAL SHARPE RATIO (DSR) — composante principale (60%)
+        # DSR = d(Sharpe)/dt, mesure incrementielle du Sharpe ratio
+        # Avantage: optimise directement le risk-adjusted return
+        # Reference: Moody & Saffell (2001), arxiv 2506.04358
+        # ===================================================================
+        A_new = self.A_prev + self.eta * (step_return - self.A_prev)
+        B_new = self.B_prev + self.eta * (step_return**2 - self.B_prev)
 
-        # === 2. Coût de transaction (pénalise le churning) ===
-        reward -= 0.01 * position_change
+        denominator = (B_new - A_new**2)
+        if denominator > 1e-10:
+            dsr = (B_new * (step_return - self.A_prev) - 0.5 * A_new * (step_return**2 - self.B_prev)) / (denominator ** 1.5 + 1e-8)
+        else:
+            dsr = step_return * 100  # fallback au debut
 
-        # === 3. Pénalité d'inaction (force l'agent à prendre position) ===
+        self.A_prev = A_new
+        self.B_prev = B_new
+
+        # Scaler le DSR pour avoir un range raisonnable
+        reward_dsr = float(np.clip(dsr * 2.0, -3.0, 3.0))
+
+        # ===================================================================
+        # 2. DRAWDOWN PENALTY (20%) — penalise la perte de capital
+        # Plus le drawdown est profond, plus la penalite est forte (quadratique)
+        # ===================================================================
+        current_dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
+        # Penalite quadratique: dd de -5% = -0.0025, dd de -10% = -0.01, dd de -20% = -0.04
+        dd_penalty = current_dd * abs(current_dd) * 10.0  # negatif quand en drawdown
+        reward_dd = float(np.clip(dd_penalty, -2.0, 0.0))
+
+        # ===================================================================
+        # 3. TRANSACTION COSTS (10%) — penalise le churning
+        # Cout realiste: position_change * fee_rate
+        # ===================================================================
+        reward_cost = -0.02 * position_change  # 2x la fee reelle pour decourager
+
+        # ===================================================================
+        # 4. CVAR TAIL RISK PENALTY (5%)
+        # Penalise les returns dans le pire 5% de la distribution recente
+        # ===================================================================
+        reward_cvar = 0.0
+        if len(self.returns_history) >= 20:
+            recent = np.array(self.returns_history[-50:])
+            var_threshold = np.percentile(recent, self.cvar_alpha * 100)
+            if step_return < var_threshold:
+                # En zone de tail risk -> forte penalite
+                reward_cvar = float(np.clip((step_return - var_threshold) * 5.0, -1.0, 0.0))
+
+        # ===================================================================
+        # 5. CONVICTION & HOLDING BONUS (5%)
+        # Recompense la conviction (rester dans un trade gagnant)
+        # Penalise l'inaction (position ~0)
+        # ===================================================================
+        reward_conviction = 0.0
+        # Bonus holding gagnant (plus le trade dure et gagne, plus le bonus monte)
+        if self.time_in_position > 3 and step_return > 0:
+            reward_conviction += 0.03 * min(self.time_in_position / 20.0, 1.0)
+        # Penalite d'inaction
         if abs(self.position) < 0.05:
-            reward -= 0.05
+            reward_conviction -= 0.03
 
-        # === 4. Bonus de holding gagnant ===
-        if self.time_in_position > 5 and self.position * market_return > 0:
-            reward += 0.05
+        # ===================================================================
+        # COMBINAISON FINALE
+        # ===================================================================
+        reward = (
+            reward_dsr * 0.60 +
+            reward_dd * 0.20 +
+            reward_cost * 0.10 +
+            reward_cvar * 0.05 +
+            reward_conviction * 0.05
+        )
 
         return float(np.clip(reward, -5.0, 5.0))
 
@@ -472,8 +583,8 @@ class RLTradingAgent:
             val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val")])
             val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
 
-            # Feature extractor : MLP (rapide) ou SSM (précis)
-            n_extra = 4
+            # Feature extractor : MLP (rapide) ou SSM (precis)
+            n_extra = 10  # 10 portfolio state features
             if fe_type == "mlp":
                 fe_class = MLPFeaturesExtractor
                 fe_kwargs = dict(lookback=lookback, n_extra=n_extra, features_dim=128)
@@ -668,12 +779,12 @@ class RLTradingAgent:
             self.load()
 
         lookback = self.cfg.get("lookback", 20)
-        n_extra = 4
+        n_extra = 10  # 10 portfolio state features
 
         # Charger VecNormalize une seule fois
         self._load_vec_normalizers(features_df, prices_df)
 
-        # Ajuster le nombre de features pour matcher le modèle
+        # Ajuster le nombre de features pour matcher le modele
         if self.models:
             first_model = next(iter(self.models.values()))
             expected_obs_size = first_model.observation_space.shape[0]
@@ -681,16 +792,15 @@ class RLTradingAgent:
             if features_df.shape[1] > expected_n_features:
                 features_df = features_df.iloc[:, :expected_n_features]
 
-        # --- Construire l'observation directement (comme dans CryptoTradingEnv._get_observation) ---
+        # --- Construire l'observation directement ---
         if len(features_df) < lookback:
             return {"direction": 0, "confidence": 0.0, "position": 0.0, "model": "rl_ensemble"}
 
-        # Dernières `lookback` lignes de features
         feat_window = features_df.iloc[-lookback:].values.astype(np.float32)
         feat_window = np.nan_to_num(feat_window, nan=0.0, posinf=5.0, neginf=-5.0)
         flat = feat_window.flatten()
 
-        # Features augmentées (valeurs neutres pour l'inférence ponctuelle)
+        # Portfolio state features (valeurs neutres pour l'inference ponctuelle)
         if len(prices_df) >= 20:
             recent_returns = np.diff(np.log(prices_df['close'].values[-21:].astype(np.float64)))
             recent_vol = float(np.std(recent_returns)) if len(recent_returns) > 1 else 0.0
@@ -698,10 +808,16 @@ class RLTradingAgent:
             recent_vol = 0.0
 
         extras = np.array([
-            0.0,                                        # position neutre
-            0.0,                                        # pas de drawdown
-            np.clip(recent_vol * 100, 0.0, 5.0),       # volatilité réalisée
-            0.0,                                        # pas de temps dans position
+            0.0,                                        # 1. position neutre
+            0.0,                                        # 2. pas de drawdown
+            np.clip(recent_vol * 100, 0.0, 5.0),       # 3. volatilite realisee
+            0.0,                                        # 4. pas de temps dans position
+            0.0,                                        # 5. unrealized PnL
+            0.0,                                        # 6. rolling sharpe
+            0.0,                                        # 7. win rate neutre
+            0.0,                                        # 8. consecutive wins
+            0.0,                                        # 9. consecutive losses
+            0.0,                                        # 10. total return
         ], dtype=np.float32)
 
         raw_obs = np.concatenate([flat, extras]).astype(np.float32)

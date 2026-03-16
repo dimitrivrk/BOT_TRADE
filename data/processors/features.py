@@ -31,7 +31,10 @@ class FeatureEngineer:
         self,
         df: pd.DataFrame,
         higher_tf_df: Optional[pd.DataFrame] = None,
+        lower_tf_df: Optional[pd.DataFrame] = None,
         include_regime: bool = True,
+        include_onchain: bool = True,
+        symbol: str = "BTC/USDT",
     ) -> pd.DataFrame:
         """
         Point d'entrée principal : calcule toutes les features.
@@ -45,6 +48,10 @@ class FeatureEngineer:
             DataFrame de features normalisées
         """
         logger.debug(f"Feature engineering sur {len(df)} bougies...")
+        # Dédupliquer l'index dès le début (timestamps en double causent ValueError)
+        if df.index.duplicated().any():
+            logger.warning(f"Index dupliqué détecté ({df.index.duplicated().sum()} doublons) → déduplication")
+            df = df[~df.index.duplicated(keep='last')]
         features = pd.DataFrame(index=df.index)
 
         # --- Retours logarithmiques ---
@@ -83,6 +90,14 @@ class FeatureEngineer:
         # --- Higher timeframe features ---
         if higher_tf_df is not None:
             features = self._add_htf_features(higher_tf_df, features)
+
+        # --- Lower timeframe micro-structure features (15m → aggregated to 1h) ---
+        if lower_tf_df is not None:
+            features = self._add_ltf_features(lower_tf_df, features)
+
+        # --- On-chain & sentiment features ---
+        if include_onchain and self.feat_config.get("onchain_enabled", True):
+            features = self._add_onchain_features(df, features, symbol)
 
         # --- Normalisation ---
         features = self._normalize(features)
@@ -289,9 +304,131 @@ class FeatureEngineer:
         htf_features['htf_ret_1'] = np.log(htf_df['close'] / htf_df['close'].shift(1))
 
         # Réindexer et forward-fill pour aligner sur le TF principal
-        htf_reindexed = htf_features.reindex(features.index, method='ffill')
+        # Dédupliquer les index avant reindex (évite ValueError sur timestamps dupliqués)
+        htf_features = htf_features[~htf_features.index.duplicated(keep='last')]
+        features_dedup = features[~features.index.duplicated(keep='last')]
+
+        htf_reindexed = htf_features.reindex(features_dedup.index, method='ffill')
         htf_reindexed.columns = [f'htf_{c}' if not c.startswith('htf_') else c for c in htf_reindexed.columns]
-        return features.join(htf_reindexed)
+        return features_dedup.join(htf_reindexed)
+
+    def _add_ltf_features(
+        self,
+        ltf_df: pd.DataFrame,
+        features: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Ajoute les features de micro-structure du lower timeframe (ex: 15m).
+
+        Au lieu de remplacer le 1h par du 15m (plus de bruit), on AGRÈGE
+        les informations 15m en features utiles alignées sur le 1h.
+
+        Features calculées :
+        - Momentum intra-heure (dernières 4 bougies 15m)
+        - Volume profile intra-heure (où se concentre le volume)
+        - Micro-volatilité (ATR 15m vs ATR 1h = mesure d'instabilité)
+        - Breakout detection (cassure de range intra-heure)
+        - Trend consistency (les 4 bougies 15m sont-elles dans la même direction ?)
+        - Close position within range (clôture en haut/bas du range intra)
+
+        Réf: Multi-resolution temporal fusion (AAAI 2025)
+        """
+        try:
+            if ltf_df.empty or len(ltf_df) < 8:
+                return features
+
+            ltf = ltf_df.copy()
+
+            # Dédupliquer l'index
+            if ltf.index.duplicated().any():
+                ltf = ltf[~ltf.index.duplicated(keep='last')]
+
+            # --- 1. Momentum intra-heure (retour des 4 dernières bougies 15m) ---
+            ltf['ret_15m'] = np.log(ltf['close'] / ltf['close'].shift(1))
+            # Retour cumulé sur 4 bougies 15m = 1h de momentum granulaire
+            ltf['ret_4_15m'] = ltf['ret_15m'].rolling(4).sum()
+
+            # --- 2. Volume profile intra-heure ---
+            # Ratio du volume de la dernière bougie 15m vs moyenne des 4
+            ltf['vol_last_vs_avg'] = ltf['volume'] / ltf['volume'].rolling(4).mean().clip(lower=1e-10)
+            # Volume spike : volume récent vs moyenne 16 bougies (4h)
+            ltf['vol_spike_ltf'] = ltf['volume'] / ltf['volume'].rolling(16).mean().clip(lower=1e-10)
+
+            # --- 3. Micro-volatilité (ATR 15m relatif) ---
+            tr = pd.concat([
+                ltf['high'] - ltf['low'],
+                (ltf['high'] - ltf['close'].shift(1)).abs(),
+                (ltf['low'] - ltf['close'].shift(1)).abs()
+            ], axis=1).max(axis=1)
+            ltf['atr_4_15m'] = tr.rolling(4).mean()
+            ltf['micro_vol'] = ltf['atr_4_15m'] / ltf['close']
+
+            # --- 4. Trend consistency (les 4 bougies 15m sont dans la même direction ?) ---
+            ltf['up_15m'] = (ltf['close'] > ltf['open']).astype(float)
+            ltf['trend_consistency'] = ltf['up_15m'].rolling(4).mean()  # 1.0 = 4/4 haussières
+
+            # --- 5. Close position dans le range intra-heure ---
+            rolling_high_4 = ltf['high'].rolling(4).max()
+            rolling_low_4 = ltf['low'].rolling(4).min()
+            range_size = rolling_high_4 - rolling_low_4
+            ltf['close_in_range'] = (ltf['close'] - rolling_low_4) / range_size.clip(lower=1e-10)
+
+            # --- 6. RSI ultra-court terme (8 bougies 15m = 2h) ---
+            delta = ltf['close'].diff()
+            gain = delta.clip(lower=0).rolling(8).mean()
+            loss = (-delta.clip(upper=0)).rolling(8).mean()
+            rs = gain / loss.clip(lower=1e-10)
+            ltf['rsi_8_15m'] = 1.0 - (1.0 / (1.0 + rs))  # normalisé 0-1
+
+            # --- 7. Breakout score (distance au range récent) ---
+            rolling_high_16 = ltf['high'].rolling(16).max()
+            rolling_low_16 = ltf['low'].rolling(16).min()
+            ltf['breakout_up'] = (ltf['close'] - rolling_high_16.shift(1)) / ltf['close']
+            ltf['breakout_down'] = (rolling_low_16.shift(1) - ltf['close']) / ltf['close']
+            ltf['breakout_score'] = ltf['breakout_up'].clip(lower=0) - ltf['breakout_down'].clip(lower=0)
+
+            # --- Agréger au timeframe principal (reindex + ffill) ---
+            ltf_features_cols = [
+                'ret_4_15m', 'vol_last_vs_avg', 'vol_spike_ltf',
+                'micro_vol', 'trend_consistency', 'close_in_range',
+                'rsi_8_15m', 'breakout_score',
+            ]
+            ltf_out = ltf[ltf_features_cols].copy()
+            ltf_out = ltf_out[~ltf_out.index.duplicated(keep='last')]
+            features_dedup = features[~features.index.duplicated(keep='last')]
+
+            ltf_reindexed = ltf_out.reindex(features_dedup.index, method='ffill')
+            ltf_reindexed.columns = [f'ltf_{c}' for c in ltf_reindexed.columns]
+            result = features_dedup.join(ltf_reindexed)
+            logger.debug(f"Lower TF features ajoutées: {len(ltf_features_cols)} colonnes")
+            return result
+
+        except Exception as e:
+            logger.warning(f"Lower TF features non calculées: {e}")
+            return features
+
+    def _add_onchain_features(
+        self,
+        df: pd.DataFrame,
+        features: pd.DataFrame,
+        symbol: str = "BTC/USDT",
+    ) -> pd.DataFrame:
+        """Ajoute les features on-chain et sentiment (funding rate, OI, F&G, etc.)."""
+        try:
+            from data.collectors.onchain import OnChainCollector
+            testnet = self.config.get("exchange", {}).get("sandbox", True)
+            collector = OnChainCollector(testnet=testnet)
+            onchain = collector.compute_onchain_features(df, symbol=symbol)
+            if not onchain.empty:
+                # Aligner les index
+                common = features.index.intersection(onchain.index)
+                if len(common) > 0:
+                    for col in onchain.columns:
+                        features[col] = onchain[col].reindex(features.index, method='ffill').fillna(0.0)
+                    logger.debug(f"On-chain features ajoutees: {len(onchain.columns)} colonnes")
+        except Exception as e:
+            logger.warning(f"On-chain features non disponibles: {e}")
+        return features
 
     def _normalize(self, features: pd.DataFrame) -> pd.DataFrame:
         """Normalise les features selon la méthode configurée."""
