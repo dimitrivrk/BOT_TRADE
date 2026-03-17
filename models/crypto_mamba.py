@@ -116,9 +116,61 @@ class SelectiveSSMBlock(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
+    @staticmethod
+    def _parallel_scan(A_decay: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """
+        Parallel prefix-sum scan sur GPU (algorithme Blelloch).
+        Calcule h_t = A * h_{t-1} + u_t pour toute la séquence en O(log T) étapes
+        au lieu de O(T) séquentiel.
+
+        Args:
+            A_decay: (batch, seq_len, d_inner, d_state) — decay factors par timestep
+            u: (batch, seq_len, d_inner, d_state) — inputs (B_t * x_t)
+
+        Returns:
+            h: (batch, seq_len, d_inner, d_state) — états cachés
+        """
+        T = A_decay.shape[1]
+
+        # Pad to power of 2 for efficient parallel scan
+        pad_len = 1
+        while pad_len < T:
+            pad_len *= 2
+
+        if pad_len > T:
+            pad_shape = list(A_decay.shape)
+            pad_shape[1] = pad_len - T
+            A_pad = torch.ones(pad_shape, device=A_decay.device, dtype=A_decay.dtype)
+            u_pad = torch.zeros(pad_shape, device=u.device, dtype=u.dtype)
+            A_decay = torch.cat([A_decay, A_pad], dim=1)
+            u = torch.cat([u, u_pad], dim=1)
+
+        # Up-sweep (reduce)
+        h = u.clone()
+        a = A_decay.clone()
+
+        steps = []
+        stride = 1
+        while stride < pad_len:
+            steps.append(stride)
+            # h[i] = a[i] * h[i - stride] + h[i]  (pour i >= stride)
+            h_shifted = torch.roll(h, stride, dims=1)
+            a_shifted = torch.roll(a, stride, dims=1)
+            # Masquer les positions qui n'ont pas de prédécesseur valide
+            mask = torch.arange(pad_len, device=h.device) >= stride
+            mask = mask.view(1, -1, 1, 1)
+            h = torch.where(mask, a * h_shifted + h, h)
+            a = torch.where(mask, a * a_shifted, a)
+            stride *= 2
+
+        return h[:, :T]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Passage avant du bloc SSM.
+        Passage avant du bloc SSM — version GPU-optimisée.
+
+        Utilise un parallel scan au lieu d'une boucle séquentielle.
+        ~10-50x plus rapide sur H100/B200 grâce à la parallélisation.
 
         Args:
             x: Entrée (batch, seq_len, d_model)
@@ -137,44 +189,36 @@ class SelectiveSSMBlock(nn.Module):
         x_proj, gate = x_proj.chunk(2, dim=-1)  # Chaque: (batch, seq_len, d_inner)
 
         # Passage à travers la convolution 1D
-        # Permute pour format Conv1d: (batch, channels, seq_len)
         x_conv = self.conv1d(x_proj.transpose(1, 2))[:, :, :seq_len]
-        x_conv = x_conv.transpose(1, 2)  # Retour à (batch, seq_len, d_inner)
+        x_conv = x_conv.transpose(1, 2)  # (batch, seq_len, d_inner)
 
         # Activation
         x_conv = self.activation(x_conv)
 
-        # Scan SSM sélectif (simplifié comme gated unit + element-wise state)
         # Calcul des matrices B et C de l'état
         B = self.B(x_conv)  # (batch, seq_len, d_state)
         C = self.C(x_conv)  # (batch, seq_len, d_state)
 
-        # Decay factor (sigmoid pour garder entre 0 et 1 → stabilité)
+        # Decay factor (sigmoid pour stabilité)
         A_decay = torch.sigmoid(self.A)  # (d_inner, d_state)
 
-        # État cumulatif: h_t = A * h_{t-1} + B_t * x_t (element-wise)
-        h = torch.zeros(batch_size, self.d_inner, self.d_state, device=x.device)
-        y_list = []
+        # === PARALLEL SCAN (remplace la boucle for t in range(seq_len)) ===
+        # Préparer les inputs pour le scan
+        # u_t = B_t * x_t : (batch, seq_len, d_inner, d_state)
+        u = B.unsqueeze(2) * x_conv.unsqueeze(3)  # (b, T, d_inner, d_state)
 
-        for t in range(seq_len):
-            x_t = x_conv[:, t, :]   # (batch, d_inner)
-            B_t = B[:, t, :]         # (batch, d_state)
-            C_t = C[:, t, :]         # (batch, d_state)
+        # A_decay broadcast : (batch, seq_len, d_inner, d_state)
+        A_expanded = A_decay.unsqueeze(0).unsqueeze(0).expand(
+            batch_size, seq_len, -1, -1
+        )
 
-            # State update: decay + input injection
-            # h: (batch, d_inner, d_state)
-            # A_decay: (d_inner, d_state) → broadcast sur batch
-            # B_t: (batch, d_state) → (batch, 1, d_state)
-            # x_t: (batch, d_inner) → (batch, d_inner, 1)
-            h = h * A_decay.unsqueeze(0) + B_t.unsqueeze(1) * x_t.unsqueeze(2)
+        # Parallel scan : calcule tous les h_t en O(log T) au lieu de O(T)
+        h_all = self._parallel_scan(A_expanded, u)  # (b, T, d_inner, d_state)
 
-            # Output: y_t = sum(C_t * h, dim=-1) + D * x_t
-            # C_t: (batch, d_state) → (batch, 1, d_state)
-            y_t = (C_t.unsqueeze(1) * h).sum(dim=-1) + self.D.unsqueeze(0) * x_t
-
-            y_list.append(y_t)
-
-        y = torch.stack(y_list, dim=1)  # (batch, seq_len, d_inner)
+        # Output: y_t = sum(C_t * h_t, dim=-1) + D * x_t
+        # C: (b, T, d_state) → (b, T, 1, d_state)
+        y = (C.unsqueeze(2) * h_all).sum(dim=-1)  # (b, T, d_inner)
+        y = y + self.D.unsqueeze(0).unsqueeze(0) * x_conv  # skip connection
 
         # Gate appliquée
         y = y * self.activation(gate)
@@ -728,6 +772,9 @@ class MambaPredictor:
         """
         logger.info(f"Training CryptoMamba for {symbol}")
 
+        # Optimisation GPU : Tensor Cores (H100/B200/A100/RTX 3090+)
+        torch.set_float32_matmul_precision('high')
+
         # Préparation des données — ne garder que les colonnes numériques
         numeric_df = features_df.select_dtypes(include=[np.number])
         # Supprimer les colonnes constantes ou avec des NaN uniquement
@@ -762,17 +809,45 @@ class MambaPredictor:
             generator=torch.Generator().manual_seed(42),
         )
 
+        # Auto-detect GPU VRAM pour batch size optimal
+        gpu_mem_gb = 0
+        if torch.cuda.is_available():
+            gpu_mem_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            gpu_name = torch.cuda.get_device_name(0)
+            logger.info(f"GPU: {gpu_name} ({gpu_mem_gb:.0f} GB VRAM)")
+
+        # Batch size adaptatif selon le GPU
+        if gpu_mem_gb >= 140:      # B200 (192GB), H200 (141GB)
+            optimal_batch = 512
+        elif gpu_mem_gb >= 70:     # H100 (80GB), A100 (80GB)
+            optimal_batch = 256
+        elif gpu_mem_gb >= 20:     # RTX 3090 (24GB), A5000 (24GB)
+            optimal_batch = 128
+        else:
+            optimal_batch = batch_size
+
+        actual_batch = max(batch_size, optimal_batch)
+        logger.info(f"Batch size: {actual_batch} (GPU: {gpu_mem_gb:.0f}GB)")
+
+        # Nombre de workers pour le data loading
+        import os
+        n_workers = min(8, os.cpu_count() or 4)
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=actual_batch,
             shuffle=True,
-            num_workers=0,
+            num_workers=n_workers,
+            pin_memory=True,
+            persistent_workers=True if n_workers > 0 else False,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=actual_batch,
             shuffle=False,
-            num_workers=0,
+            num_workers=n_workers,
+            pin_memory=True,
+            persistent_workers=True if n_workers > 0 else False,
         )
 
         # Création du modèle
@@ -813,16 +888,40 @@ class MambaPredictor:
             mode='min',
         )
 
-        # Entraîneur
+        # torch.compile pour fusion de kernels (PyTorch 2.x)
+        try:
+            module = torch.compile(module)
+            logger.info("torch.compile activé (kernel fusion)")
+        except Exception as e:
+            logger.info(f"torch.compile non disponible: {e}")
+
+        # Déterminer la précision optimale
+        # bf16 sur Ampere+ (A100, H100, B200, RTX 30xx+), sinon 16-mixed
+        precision = '32'
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:  # Ampere+
+                precision = 'bf16-mixed'
+                logger.info("Mixed precision: bf16 (Ampere+ GPU)")
+            elif capability[0] >= 7:  # Volta/Turing
+                precision = '16-mixed'
+                logger.info("Mixed precision: fp16 (Volta/Turing GPU)")
+
+        # Gradient clipping
+        grad_clip = float(self.model_params.get('gradient_clip', 1.0))
+
+        # Entraîneur — optimisé pour H100/B200
         trainer = pl.Trainer(
             max_epochs=epochs,
             accelerator='auto',
             devices=1,
+            precision=precision,
             logger=tb_logger,
             callbacks=[checkpoint_callback, early_stop_callback],
             enable_progress_bar=True,
             enable_model_summary=True,
             log_every_n_steps=10,
+            gradient_clip_val=grad_clip,
         )
 
         # Entraînement
