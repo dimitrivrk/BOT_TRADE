@@ -121,19 +121,23 @@ class SelectiveSSMBlock(nn.Module):
         """
         Parallel prefix-sum scan sur GPU (algorithme Blelloch).
         Calcule h_t = A * h_{t-1} + u_t pour toute la séquence en O(log T) étapes.
-        Version optimisée mémoire : slicing au lieu de roll + mask.
+        Version out-of-place compatible autograd, sans padding power-of-2.
         """
         T = A_decay.shape[1]
-        h = u.clone()
-        a = A_decay.clone()
+        h = u
+        a = A_decay
 
         stride = 1
         while stride < T:
-            # Slicing direct : pas de roll ni masking (économie mémoire ~50%)
-            h_prev = h[:, :-stride].clone()
-            a_prev = a[:, :-stride].clone()
-            h[:, stride:] = a[:, stride:] * h_prev + h[:, stride:]
-            a[:, stride:] = a[:, stride:] * a_prev
+            # Construire le nouveau h et a par concaténation (out-of-place)
+            h_left = h[:, :stride]                          # positions non touchées
+            h_right = a[:, stride:] * h[:, :-stride] + h[:, stride:]  # positions mises à jour
+            h = torch.cat([h_left, h_right], dim=1)
+
+            a_left = a[:, :stride]
+            a_right = a[:, stride:] * a[:, :-stride]
+            a = torch.cat([a_left, a_right], dim=1)
+
             stride *= 2
 
         return h
