@@ -1,11 +1,12 @@
 """
-Agent de Reinforcement Learning v3 pour le trading crypto.
+Agent de Reinforcement Learning v4 pour le trading crypto.
 
-Architecture état de l'art 2025 :
+Architecture état de l'art 2025-2026 :
   - Ensemble de 3 agents : SAC + PPO + DDPG
-  - Reward risk-aware : Differential Sharpe + pénalité CVaR + drawdown
+  - Reward v5.0 : Stabilized DSR + Profit + Drawdown + CVaR + Conviction
   - Feature extractor SSM-inspired (State Space Model léger)
   - Vote pondéré dynamique entre les 3 agents
+  - Hyperparams optimisés pour crypto 1h (gamma=0.97, separate critic lr)
 """
 
 import numpy as np
@@ -74,9 +75,12 @@ class CryptoTradingEnv(gym.Env):
         self.cvar_lambda = config.get("cvar_lambda", 0.5)  # poids de la pénalité CVaR
 
         # Differential Sharpe Ratio state (EMA)
-        self.eta = 0.01
+        self.eta = 0.02  # v5: eta plus haut = EMA plus réactive (s'adapte plus vite)
         self.A_prev = 0.0
         self.B_prev = 0.0
+
+        # v5: Episode max length — des episodes plus courts = plus de diversité
+        self.max_episode_length = config.get("max_episode_length", 2000)  # ~83 jours en 1h
 
         # Observation augmentee : features + portfolio state enrichi
         # 10 features augmentees vs 4 avant = meilleure conscience de l'etat
@@ -100,12 +104,15 @@ class CryptoTradingEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Randomiser le point de départ en mode train
-        if self.mode == "train" and len(self.prices) > self.lookback + 500:
-            max_start = len(self.prices) - 500
+        # v5: Randomiser le point de départ en mode train
+        # Minimum 200 steps d'épisode pour que l'agent ait le temps d'apprendre
+        min_episode = 200
+        if self.mode == "train" and len(self.prices) > self.lookback + min_episode:
+            max_start = len(self.prices) - min_episode
             self.current_step = self.np_random.integers(self.lookback, max_start)
         else:
             self.current_step = self.lookback
+        self._episode_start = self.current_step
 
         self.balance = float(self.initial_balance)
         self.position = 0.0
@@ -233,11 +240,16 @@ class CryptoTradingEnv(gym.Env):
 
         # Avancer
         self.current_step += 1
+        steps_in_episode = self.current_step - self._episode_start
         terminated = (
             self.current_step >= len(self.prices) - 1
-            or self.balance < self.initial_balance * 0.5
+            or self.balance < self.initial_balance * 0.5  # stop si perd 50%
         )
-        truncated = False
+        # v5: truncate si episode trop long (force la diversité des conditions de marché)
+        truncated = (
+            self.mode == "train"
+            and steps_in_episode >= self.max_episode_length
+        )
 
         obs = self._get_observation() if not terminated else np.zeros(
             self.observation_space.shape, dtype=np.float32
@@ -255,17 +267,23 @@ class CryptoTradingEnv(gym.Env):
 
     def _compute_reward(self, position_change: float) -> float:
         """
-        Reward v4.0 -- Multi-objectif state-of-the-art 2025.
+        Reward v5.0 -- Multi-objectif optimisé 2025-2026.
 
-        Combine 5 composantes (recherche: arxiv 2506.04358, MDPI 2024):
-          1. Differential Sharpe Ratio (DSR) - risk-adjusted return incrementiel
-          2. Drawdown penalty - penalise les pertes en capital
-          3. Transaction costs - penalise le churning
-          4. CVaR tail risk penalty - penalise les queues de distribution
-          5. Holding bonus / conviction reward
+        6 composantes rééquilibrées (recherche: arxiv 2511.20678, MDPI 2024):
+          1. Profit direct (30%) — signal clair et immédiat
+          2. Differential Sharpe Ratio stabilisé (25%) — risk-adjusted
+          3. Drawdown penalty progressive (20%) — protège le capital
+          4. Transaction costs (10%) — anti-churning
+          5. CVaR tail risk penalty (8%) — protège contre les queues
+          6. Conviction & trend-following bonus (7%) — rewards holding winners
 
-        Le DSR est superieur au simple return car il optimise le Sharpe directement,
-        ce qui force l'agent a chercher des trades a haut ratio rendement/risque.
+        Changements v5 vs v4:
+        - Ajout profit direct 30% : donne un signal clair dès le début (DSR seul est instable)
+        - DSR réduit de 60%→25% : encore utile mais ne domine plus le reward shaping
+        - DSR warmup : fallback linéaire pendant les 100 premiers steps (évite div/0)
+        - Drawdown progressive : 3 paliers au lieu d'un seul quadratique
+        - CVaR renforcé 5%→8% : meilleure protection tail risk
+        - Conviction améliorée : bonus proportionnel au PnL, pas juste au temps
         """
         if self.current_step < len(self.returns):
             market_return = self.returns[self.current_step - 1]
@@ -276,75 +294,99 @@ class CryptoTradingEnv(gym.Env):
         step_return = self.position * market_return
 
         # ===================================================================
-        # 1. DIFFERENTIAL SHARPE RATIO (DSR) — composante principale (60%)
-        # DSR = d(Sharpe)/dt, mesure incrementielle du Sharpe ratio
-        # Avantage: optimise directement le risk-adjusted return
-        # Reference: Moody & Saffell (2001), arxiv 2506.04358
+        # 1. PROFIT DIRECT (30%) — signal clair et immédiat
+        # Avantage: l'agent comprend vite que position*return = argent
+        # Scaled pour être dans [-2, 2] avec des returns crypto typiques
+        # ===================================================================
+        reward_profit = float(np.clip(step_return * 100.0, -2.0, 2.0))
+
+        # ===================================================================
+        # 2. DIFFERENTIAL SHARPE RATIO STABILISÉ (25%)
+        # DSR = d(Sharpe)/dt — optimise le risk-adjusted return
+        # NOUVEAU: warmup pendant 100 steps pour éviter instabilité initiale
         # ===================================================================
         A_new = self.A_prev + self.eta * (step_return - self.A_prev)
         B_new = self.B_prev + self.eta * (step_return**2 - self.B_prev)
 
         denominator = (B_new - A_new**2)
-        if denominator > 1e-10:
+        n_steps = len(self.returns_history)
+
+        if n_steps < 100:
+            # Warmup: utiliser un DSR simplifié pendant que les stats se stabilisent
+            # Proportionnel au step_return mais atténué par le ratio n/100
+            warmup_factor = n_steps / 100.0
+            dsr = step_return * 50.0 * warmup_factor
+        elif denominator > 1e-8:
             dsr = (B_new * (step_return - self.A_prev) - 0.5 * A_new * (step_return**2 - self.B_prev)) / (denominator ** 1.5 + 1e-8)
         else:
-            dsr = step_return * 100  # fallback au debut
+            dsr = step_return * 50.0
 
         self.A_prev = A_new
         self.B_prev = B_new
 
-        # Scaler le DSR pour avoir un range raisonnable
-        reward_dsr = float(np.clip(dsr * 2.0, -3.0, 3.0))
+        reward_dsr = float(np.clip(dsr * 1.0, -2.0, 2.0))
 
         # ===================================================================
-        # 2. DRAWDOWN PENALTY (20%) — penalise la perte de capital
-        # Plus le drawdown est profond, plus la penalite est forte (quadratique)
+        # 3. DRAWDOWN PENALTY PROGRESSIVE (20%)
+        # 3 paliers: léger (<5%), modéré (5-15%), sévère (>15%)
+        # Plus réaliste que le quadratique pur
         # ===================================================================
         current_dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
-        # Penalite quadratique: dd de -5% = -0.0025, dd de -10% = -0.01, dd de -20% = -0.04
-        dd_penalty = current_dd * abs(current_dd) * 10.0  # negatif quand en drawdown
-        reward_dd = float(np.clip(dd_penalty, -2.0, 0.0))
+        if current_dd > -0.05:
+            dd_penalty = current_dd * 5.0  # léger
+        elif current_dd > -0.15:
+            dd_penalty = -0.25 + (current_dd + 0.05) * 15.0  # modéré
+        else:
+            dd_penalty = -1.75 + (current_dd + 0.15) * 30.0  # sévère
+        reward_dd = float(np.clip(dd_penalty, -3.0, 0.0))
 
         # ===================================================================
-        # 3. TRANSACTION COSTS (10%) — penalise le churning
-        # Cout realiste: position_change * fee_rate
+        # 4. TRANSACTION COSTS (10%) — anti-churning
+        # Pénalise les changements de position fréquents
         # ===================================================================
-        reward_cost = -0.02 * position_change  # 2x la fee reelle pour decourager
+        reward_cost = float(-0.03 * position_change)
 
         # ===================================================================
-        # 4. CVAR TAIL RISK PENALTY (5%)
-        # Penalise les returns dans le pire 5% de la distribution recente
+        # 5. CVAR TAIL RISK PENALTY (8%)
+        # Penalise les returns dans le pire 5% de la distribution
+        # NOUVEAU: penalty proportionnelle à la distance au VaR
         # ===================================================================
         reward_cvar = 0.0
-        if len(self.returns_history) >= 20:
-            recent = np.array(self.returns_history[-50:])
+        if len(self.returns_history) >= 30:
+            recent = np.array(self.returns_history[-100:])
             var_threshold = np.percentile(recent, self.cvar_alpha * 100)
             if step_return < var_threshold:
-                # En zone de tail risk -> forte penalite
-                reward_cvar = float(np.clip((step_return - var_threshold) * 5.0, -1.0, 0.0))
+                # Pénalité proportionnelle : plus on est loin du VaR, pire c'est
+                reward_cvar = float(np.clip((step_return - var_threshold) * 8.0, -2.0, 0.0))
 
         # ===================================================================
-        # 5. CONVICTION & HOLDING BONUS (5%)
-        # Recompense la conviction (rester dans un trade gagnant)
-        # Penalise l'inaction (position ~0)
+        # 6. CONVICTION & TREND-FOLLOWING BONUS (7%)
+        # Récompense la conviction (rester dans un trade gagnant)
+        # NOUVEAU: bonus proportionnel au unrealized PnL, pas juste au temps
         # ===================================================================
         reward_conviction = 0.0
-        # Bonus holding gagnant (plus le trade dure et gagne, plus le bonus monte)
-        if self.time_in_position > 3 and step_return > 0:
-            reward_conviction += 0.03 * min(self.time_in_position / 20.0, 1.0)
-        # Penalite d'inaction
+        # Bonus holding gagnant — proportionnel au PnL et au temps
+        if self.time_in_position > 2 and step_return > 0:
+            time_factor = min(self.time_in_position / 15.0, 1.0)
+            pnl_factor = min(abs(step_return) * 50.0, 1.0)
+            reward_conviction += 0.05 * time_factor * (1.0 + pnl_factor)
+        # Pénalité douce d'inaction (ne pas être flat trop longtemps)
         if abs(self.position) < 0.05:
-            reward_conviction -= 0.03
+            reward_conviction -= 0.02
+        # Bonus trend-following : reward si position est dans la même direction que le marché
+        if self.position * market_return > 0 and abs(self.position) > 0.2:
+            reward_conviction += 0.02
 
         # ===================================================================
-        # COMBINAISON FINALE
+        # COMBINAISON FINALE — rééquilibrée pour signal plus clair
         # ===================================================================
         reward = (
-            reward_dsr * 0.60 +
+            reward_profit * 0.30 +
+            reward_dsr * 0.25 +
             reward_dd * 0.20 +
             reward_cost * 0.10 +
-            reward_cvar * 0.05 +
-            reward_conviction * 0.05
+            reward_cvar * 0.08 +
+            reward_conviction * 0.07
         )
 
         return float(np.clip(reward, -5.0, 5.0))
@@ -390,9 +432,7 @@ class CryptoTradingEnv(gym.Env):
 
 class MLPFeaturesExtractor(BaseFeaturesExtractor):
     """
-    Feature extractor MLP simple et RAPIDE.
-    Flatten l'observation + 3 couches denses. ~5x plus rapide que Conv1D.
-    Parfait pour un premier run rapide.
+    Feature extractor MLP v5 — plus profond avec LayerNorm et résidual.
     """
 
     def __init__(self, observation_space: spaces.Box, lookback: int = 10,
@@ -401,27 +441,38 @@ class MLPFeaturesExtractor(BaseFeaturesExtractor):
 
         n_total = observation_space.shape[0]
 
-        self.net = nn.Sequential(
-            nn.Linear(n_total, 256),
+        self.block1 = nn.Sequential(
+            nn.Linear(n_total, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Dropout(0.1),
+        )
+        self.block2 = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
             nn.ReLU(),
-            nn.Linear(128, features_dim),
+            nn.Dropout(0.1),
+        )
+        self.block3 = nn.Sequential(
+            nn.Linear(256, features_dim),
+            nn.LayerNorm(features_dim),
             nn.ReLU(),
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
+        x = self.block1(obs)
+        x = self.block2(x)
+        return self.block3(x)
 
 
 class SSMFeaturesExtractor(BaseFeaturesExtractor):
     """
-    Feature extractor SSM-inspired (précis) pour capturer les dépendances temporelles.
-    Utilise Conv1D + Gating. Plus lent mais meilleur résultat.
+    Feature extractor SSM-inspired v5 — Multi-scale Conv1D + Temporal Attention + Gating.
+    Captures court/moyen/long terme + attention sur les timesteps les plus importants.
     """
 
     def __init__(self, observation_space: spaces.Box, lookback: int = 20,
-                 n_extra: int = 4, features_dim: int = 256):
+                 n_extra: int = 10, features_dim: int = 256):
         super().__init__(observation_space, features_dim=features_dim)
 
         n_total = observation_space.shape[0]
@@ -429,7 +480,7 @@ class SSMFeaturesExtractor(BaseFeaturesExtractor):
         self.lookback = lookback
         self.n_features = (n_total - n_extra) // lookback
 
-        # SSM-like block : Conv1D + Gate + Residual
+        # Input projection + norm
         self.input_proj = nn.Linear(self.n_features, 128)
         self.norm1 = nn.LayerNorm(128)
 
@@ -443,12 +494,28 @@ class SSMFeaturesExtractor(BaseFeaturesExtractor):
             nn.Linear(192, 192),
             nn.Sigmoid(),
         )
-
         self.norm2 = nn.LayerNorm(192)
 
-        # Aggregation
+        # v5: Temporal attention — apprend quels timesteps sont les plus importants
+        self.temporal_attn = nn.Sequential(
+            nn.Linear(192, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1),  # score par timestep
+        )
+
+        # v5: Residual block pour les extras (portfolio state est critique)
+        self.extras_proj = nn.Sequential(
+            nn.Linear(n_extra, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+        )
+
+        # Aggregation finale
         self.agg = nn.Sequential(
-            nn.Linear(192 + n_extra, features_dim),
+            nn.Linear(192 + 64, features_dim),
+            nn.LayerNorm(features_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(features_dim, features_dim),
@@ -467,24 +534,28 @@ class SSMFeaturesExtractor(BaseFeaturesExtractor):
 
         # Multi-scale convolutions (B, T, C) → (B, C, T)
         x_t = x.transpose(1, 2)
-        c_short = torch.nn.functional.silu(self.conv_short(x_t))   # (B, 64, T)
-        c_med = torch.nn.functional.silu(self.conv_med(x_t))       # (B, 64, T)
-        c_long = torch.nn.functional.silu(self.conv_long(x_t))     # (B, 64, T)
+        c_short = torch.nn.functional.silu(self.conv_short(x_t))
+        c_med = torch.nn.functional.silu(self.conv_med(x_t))
+        c_long = torch.nn.functional.silu(self.conv_long(x_t))
 
-        # Concat multi-scale → (B, 192, T)
-        multi = torch.cat([c_short, c_med, c_long], dim=1)
-        multi = multi.transpose(1, 2)  # (B, T, 192)
+        # Concat multi-scale → (B, T, 192)
+        multi = torch.cat([c_short, c_med, c_long], dim=1).transpose(1, 2)
 
         # Gating (selective scan simplifiée)
         gate_vals = self.gate(multi)
         multi = multi * gate_vals
-
         multi = self.norm2(multi)
 
-        # Dernier token + extras
-        last_token = multi[:, -1, :]  # (B, 192)
-        combined = torch.cat([last_token, extras], dim=1)  # (B, 192 + 4)
+        # v5: Temporal attention pooling (au lieu de juste prendre le dernier token)
+        # L'attention apprend quels timesteps sont les plus informatifs
+        attn_scores = self.temporal_attn(multi)            # (B, T, 1)
+        attn_weights = torch.softmax(attn_scores, dim=1)   # (B, T, 1)
+        context = (multi * attn_weights).sum(dim=1)         # (B, 192)
 
+        # v5: Traiter les portfolio state features séparément (pas les mélanger avec le temps)
+        extras_out = self.extras_proj(extras)  # (B, 64)
+
+        combined = torch.cat([context, extras_out], dim=1)  # (B, 192 + 64)
         return self.agg(combined)
 
 
@@ -668,20 +739,20 @@ class RLTradingAgent:
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
-                net_arch=[256, 128],
+                net_arch=[512, 256, 128],       # v5: plus profond (meilleure expressivité)
                 activation_fn=nn.ReLU,
             )
             return SAC(
                 "MlpPolicy", env,
-                learning_rate=lr,
-                buffer_size=int(self.cfg.get("buffer_size", 500_000)),
-                learning_starts=int(self.cfg.get("learning_starts", 5000)),
-                batch_size=512,
+                learning_rate=lr,                # actor lr = 1e-4
+                buffer_size=int(self.cfg.get("buffer_size", 200_000)),  # v5: 200k (données plus récentes)
+                learning_starts=int(self.cfg.get("learning_starts", 2000)),  # v5: démarrer plus tôt
+                batch_size=256,                  # v5: 256 (plus de variance dans les gradients)
                 tau=float(self.cfg.get("tau", 0.005)),
-                gamma=float(self.cfg.get("gamma", 0.99)),
-                train_freq=4,
-                gradient_steps=1,
-                ent_coef="auto",
+                gamma=0.97,                      # v5: 0.97 (horizon ~33 candles = 33h, adapté crypto 1h)
+                train_freq=1,                    # v5: update à chaque step
+                gradient_steps=2,                # v5: 2 gradient steps par update (apprend 2x plus vite)
+                ent_coef=0.2,                    # v5: démarrer plus bas (exploration modérée dès le début)
                 target_entropy="auto",
                 policy_kwargs=policy_kwargs,
                 verbose=1,
@@ -693,20 +764,23 @@ class RLTradingAgent:
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
-                net_arch=dict(pi=[256, 128], vf=[256, 128]),
+                net_arch=dict(
+                    pi=[512, 256, 128],        # v5: policy plus large
+                    vf=[512, 256, 128],        # v5: value plus large
+                ),
                 activation_fn=nn.ReLU,
             )
             return PPO(
                 "MlpPolicy", env,
                 learning_rate=lr,
-                n_steps=2048,
-                batch_size=256,
-                n_epochs=10,
-                gamma=float(self.cfg.get("gamma", 0.99)),
-                gae_lambda=0.95,
-                clip_range=0.2,
-                ent_coef=0.01,
-                target_kl=0.02,
+                n_steps=4096,                  # v5: plus de data par update (meilleur GAE)
+                batch_size=512,                # v5: 512 (plus stable)
+                n_epochs=15,                   # v5: 15 epochs (exploitation plus poussée)
+                gamma=0.97,                    # v5: même horizon que SAC
+                gae_lambda=0.92,               # v5: 0.92 (bias vers l'exploitation, moins de variance)
+                clip_range=0.15,               # v5: clip plus serré (plus conservative updates)
+                ent_coef=0.005,                # v5: moins d'exploration que SAC
+                target_kl=0.015,               # v5: plus strict (early stopping plus agressif)
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
@@ -718,24 +792,24 @@ class RLTradingAgent:
             n_actions = 1
             action_noise = OrnsteinUhlenbeckActionNoise(
                 mean=np.zeros(n_actions),
-                sigma=0.2 * np.ones(n_actions),
+                sigma=0.15 * np.ones(n_actions),   # v5: sigma réduit (moins de bruit)
             )
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
-                net_arch=[256, 128],
+                net_arch=[512, 256, 128],           # v5: plus profond
                 activation_fn=nn.ReLU,
             )
             return DDPG(
                 "MlpPolicy", env,
                 learning_rate=lr,
-                buffer_size=int(self.cfg.get("buffer_size", 500_000)),
-                learning_starts=int(self.cfg.get("learning_starts", 5000)),
-                batch_size=512,
+                buffer_size=int(self.cfg.get("buffer_size", 200_000)),  # v5: 200k
+                learning_starts=int(self.cfg.get("learning_starts", 2000)),  # v5: plus tôt
+                batch_size=256,                     # v5: 256
                 tau=float(self.cfg.get("tau", 0.005)),
-                gamma=float(self.cfg.get("gamma", 0.99)),
-                train_freq=4,
-                gradient_steps=1,
+                gamma=0.97,                         # v5: même horizon que SAC/PPO
+                train_freq=1,                       # v5: update chaque step
+                gradient_steps=2,                   # v5: 2 gradient steps
                 action_noise=action_noise,
                 policy_kwargs=policy_kwargs,
                 verbose=1,

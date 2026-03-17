@@ -131,35 +131,36 @@ models:
     learning_rate: 1e-3
     checkpoint_dir: "checkpoints/tft"
 
-  # --- Reinforcement Learning v3 (Ensemble SAC + PPO + DDPG) ---
+  # --- Reinforcement Learning v4 (Ensemble SAC + PPO + DDPG) ---
   rl:
     enabled: true
     # Ensemble complet : SAC + PPO + DDPG
     ensemble_agents:
-      - "SAC"              # Meilleur en haute volatilite
+      - "SAC"              # Meilleur en haute volatilite (max-entropy)
       - "PPO"              # Le plus stable et robuste
       - "DDPG"             # Le plus rapide, bon pour trends clairs
     # Params communs
-    learning_rate: 1e-4    # lr standard pour convergence stable
-    gamma: 0.99
-    buffer_size: 500000    # buffer complet
-    learning_starts: 5000
+    learning_rate: 1e-4    # actor lr (critic lr séparé dans le code)
+    gamma: 0.97            # v5: horizon ~33 candles (adapté crypto 1h)
+    buffer_size: 200000    # v5: 200k (données plus récentes, moins de stale data)
+    learning_starts: 2000  # v5: démarrer plus tôt
     tau: 0.005
     total_timesteps: 500000  # 500k steps par agent
-    lookback: 20             # fenetre complete
+    lookback: 48             # v5: 48 candles = 2 jours (plus de contexte)
     checkpoint_dir: "checkpoints/rl"
     n_envs: 24               # envs paralleles (SubprocVecEnv)
     eval_freq: 2000          # eval toutes les ~48k timesteps
     n_eval_episodes: 3       # 3 episodes d'eval
-    feature_extractor: "ssm" # ssm = Conv1D multi-scale (precis)
+    feature_extractor: "ssm" # ssm = Conv1D multi-scale + temporal attention
     env:
       initial_balance: 10000
       max_position_pct: 0.5
       transaction_cost: 0.001
       reward_type: "risk_aware"
-      lookback: 20           # doit matcher le lookback du RL
+      lookback: 48           # v5: doit matcher le lookback du RL
       cvar_alpha: 0.05       # 5% tail risk pour CVaR
       cvar_lambda: 0.2       # poids de la penalite CVaR
+      max_episode_length: 2000  # v5: episodes de ~83 jours max
 
   # --- Feature Selection (XGBoost) ---
   feature_selection:
@@ -175,10 +176,10 @@ models:
   ensemble:
     enabled: true
     method: "weighted"     # weighted | voting
-    mamba_weight: 0.00     # 0 = Mamba pas entraine. Mettre 0.35 apres training
-    rl_weight: 0.70        # RL Ensemble = signal principal
-    technical_weight: 0.30 # signaux techniques = confirmation
-    confidence_threshold: 0.65  # only take high-confidence trades
+    mamba_weight: 0.35     # Mamba entrainé (val_loss=-0.058)
+    rl_weight: 0.40        # RL Ensemble = signal principal
+    technical_weight: 0.25 # signaux techniques = confirmation
+    confidence_threshold: 0.60  # v5: seuil abaissé (plus d'opportunités, mamba compense)
 
 backtesting:
   engine: "vectorbt"
