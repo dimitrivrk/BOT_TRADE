@@ -203,10 +203,22 @@ class OnChainCollector:
         features = pd.DataFrame(index=ohlcv_df.index)
         sym = symbol.replace('/', '')
 
+        def _normalize_index(s: pd.Series) -> pd.Series:
+            """Normalise l'index d'une Series en UTC pour le reindex."""
+            idx = s.index
+            if hasattr(idx, 'tz') and idx.tz is None:
+                idx = idx.tz_localize('UTC')
+            else:
+                idx = idx.tz_convert('UTC')
+            # Convertir en datetime64[ms, UTC] pour correspondre à l'index OHLCV
+            s.index = idx.astype('datetime64[ms, UTC]')
+            return s
+
         # --- Funding Rate ---
         try:
             fr = self.get_funding_rate(sym, limit=100)
             if not fr.empty:
+                fr = _normalize_index(fr)
                 fr_reindexed = fr.reindex(ohlcv_df.index, method='ffill')
                 features['funding_rate'] = fr_reindexed
                 features['funding_rate_ma'] = features['funding_rate'].rolling(8, min_periods=1).mean()
@@ -220,7 +232,7 @@ class OnChainCollector:
         try:
             oi = self.get_open_interest(sym, period="1h", limit=100)
             if not oi.empty:
-                oi_reindexed = oi['sumOpenInterestValue'].reindex(ohlcv_df.index, method='ffill')
+                oi_reindexed = _normalize_index(oi['sumOpenInterestValue']).reindex(ohlcv_df.index, method='ffill')
                 features['oi_change_pct'] = oi_reindexed.pct_change(1)
                 # Divergence OI vs prix: OI monte + prix baisse = bearish signal
                 price_change = ohlcv_df['close'].pct_change(1)
@@ -233,7 +245,7 @@ class OnChainCollector:
         try:
             ls = self.get_long_short_ratio(sym, period="1h", limit=100)
             if not ls.empty:
-                ls_reindexed = ls['longShortRatio'].reindex(ohlcv_df.index, method='ffill')
+                ls_reindexed = _normalize_index(ls['longShortRatio']).reindex(ohlcv_df.index, method='ffill')
                 features['ls_ratio'] = (ls_reindexed - 1.0)  # centre sur 0
                 features['ls_ratio_extreme'] = 0.0
                 features.loc[ls_reindexed > 2.0, 'ls_ratio_extreme'] = 1.0    # trop de longs
@@ -245,7 +257,7 @@ class OnChainCollector:
         try:
             fng = self.get_fear_greed_index(limit=30)
             if not fng.empty:
-                fng_reindexed = fng.reindex(ohlcv_df.index, method='ffill')
+                fng_reindexed = _normalize_index(fng).reindex(ohlcv_df.index, method='ffill')
                 features['fng_value'] = fng_reindexed / 100.0  # normaliser [0, 1]
                 features['fng_extreme'] = 0.0
                 features.loc[fng_reindexed > 75, 'fng_extreme'] = 1.0     # extreme greed
@@ -257,7 +269,7 @@ class OnChainCollector:
         try:
             taker = self.get_taker_buy_sell_volume(sym, period="1h", limit=100)
             if not taker.empty:
-                taker_reindexed = taker['buySellRatio'].reindex(ohlcv_df.index, method='ffill')
+                taker_reindexed = _normalize_index(taker['buySellRatio']).reindex(ohlcv_df.index, method='ffill')
                 features['taker_ratio'] = taker_reindexed - 1.0  # centre sur 0
         except Exception as e:
             logger.debug(f"Taker ratio features skipped: {e}")

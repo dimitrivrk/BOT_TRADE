@@ -729,9 +729,18 @@ class MambaPredictor:
         """
         logger.info(f"Training CryptoMamba for {symbol}")
 
-        # Préparation des données
-        features = features_df.values
-        prices = prices_df.values.flatten()
+        # Préparation des données — ne garder que les colonnes numériques
+        numeric_df = features_df.select_dtypes(include=[np.number])
+        # Supprimer les colonnes constantes ou avec des NaN uniquement
+        numeric_df = numeric_df.dropna(axis=1, how='all')
+        numeric_df = numeric_df.fillna(0.0)
+        # Remplacer inf par 0
+        numeric_df = numeric_df.replace([np.inf, -np.inf], 0.0)
+
+        logger.info(f"Mamba training: {numeric_df.shape[1]} features numériques (sur {features_df.shape[1]} totales)")
+
+        features = numeric_df.values.astype(np.float32)
+        prices = prices_df.values.flatten().astype(np.float64)
 
         # Normalisation
         self.scaler = StandardScaler()
