@@ -16,6 +16,8 @@ pyarrow>=14.0.0              # format parquet pour la persistence
 torch>=2.1.0
 torchvision>=0.16.0
 pytorch-lightning>=2.1.0
+mamba-ssm                    # CryptoMamba SSM (nécessite CUDA, --no-build-isolation)
+einops>=0.7.0                # requis par Mamba
 
 # --- TFT ---
 pytorch-forecasting>=1.0.0   # Temporal Fusion Transformer
@@ -29,6 +31,11 @@ shimmy>=1.3.0                # compatibilité gym/gymnasium
 # --- Backtesting ---
 vectorbt>=0.25.5
 ta-lib>=0.4.28               # optionnel, pour les indicateurs TA-Lib C
+
+# --- Machine Learning ---
+xgboost>=2.0.0               # feature selection
+scikit-learn>=1.3.0          # normalisation RL, métriques
+requests>=2.31.0             # appels API on-chain (Fear&Greed, etc.)
 
 # --- Hyperparameter Optimization ---
 optuna>=3.4.0
