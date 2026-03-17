@@ -633,8 +633,8 @@ class CryptoMambaModule(pl.LightningModule):
         """Configure l'optimiseur et le scheduler."""
         optimizer = AdamW(
             self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
+            lr=float(self.learning_rate),
+            weight_decay=float(self.weight_decay),
         )
 
         scheduler = CosineAnnealingLR(
