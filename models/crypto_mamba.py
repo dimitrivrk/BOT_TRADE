@@ -812,7 +812,7 @@ class MambaPredictor:
         # Auto-detect GPU VRAM pour batch size optimal
         gpu_mem_gb = 0
         if torch.cuda.is_available():
-            gpu_mem_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             gpu_name = torch.cuda.get_device_name(0)
             logger.info(f"GPU: {gpu_name} ({gpu_mem_gb:.0f} GB VRAM)")
 
