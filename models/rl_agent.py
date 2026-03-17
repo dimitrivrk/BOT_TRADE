@@ -624,13 +624,9 @@ class RLTradingAgent:
                 progress_bar=False,
             )
 
-            # Sauvegarder
+            # Sauvegarder sur disque
             env.save(str(algo_ckpt / "vec_normalize.pkl"))
             model.save(str(algo_ckpt / "final_model"))
-
-            self.models[algo_name] = model
-            # NE PAS stocker env dans self — ça crée des thread locks
-            # qui empêchent le pickle lors de la création du prochain SubprocVecEnv
             logger.info(f"Agent {algo_name} entraîné et sauvegardé !")
 
             # Fermer et supprimer les envs pour libérer les process/locks
@@ -639,7 +635,22 @@ class RLTradingAgent:
                 env.close()
             except Exception:
                 pass
-            del env, val_env
+            # Libérer toute la mémoire (replay buffer, thread locks, etc.)
+            # Indispensable pour que SubprocVecEnv du prochain agent ne crash pas
+            del env, val_env, model
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Recharger tous les modèles depuis le disque (évite les thread locks en mémoire)
+        algo_classes = {"SAC": SAC, "PPO": PPO, "DDPG": DDPG}
+        for algo_name in self.agent_names:
+            algo_ckpt = self.checkpoint_dir / algo_name.lower()
+            model_path = algo_ckpt / "final_model.zip"
+            if model_path.exists():
+                self.models[algo_name] = algo_classes[algo_name].load(str(algo_ckpt / "final_model"))
+                logger.info(f"Modèle {algo_name} rechargé depuis disque")
 
         # Garder compatibilité avec l'interface single model
         if self.agent_names:
