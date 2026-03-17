@@ -312,20 +312,17 @@ class MergeBlock(nn.Module):
         Returns:
             Sortie fusionnée (batch, seq_len, d_model)
         """
-        # Empiler les branches
-        x = torch.stack(branches, dim=2)  # (batch, seq_len, num_branches, d_model)
-        batch_size, seq_len, num_branches, d_model = x.shape
+        # Empiler les branches : (batch, seq_len, num_branches, d_model)
+        x = torch.stack(branches, dim=2)
 
-        # Reshape pour l'attention
-        x = x.view(batch_size, seq_len, num_branches * d_model)
-        x = self.norm(x)
+        # Moyenne des branches : (batch, seq_len, d_model)
+        x_mean = x.mean(dim=2)
 
-        # Projection dans l'espace d'attention
-        x_proj = x.view(batch_size, seq_len, num_branches, d_model)
-        x_proj = x_proj.mean(dim=2)  # Moyenne simple des branches
+        # Normaliser
+        x_mean = self.norm(x_mean)
 
-        # Attention pour agréger
-        x_attn, _ = self.attention(x_proj, x_proj, x_proj)
+        # Self-attention pour raffiner la fusion
+        x_attn, _ = self.attention(x_mean, x_mean, x_mean)
 
         return x_attn
 
