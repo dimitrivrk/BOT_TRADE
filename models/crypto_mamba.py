@@ -82,6 +82,7 @@ class SelectiveSSMBlock(nn.Module):
         self.expand_factor = expand_factor
 
         d_inner = int(d_model * expand_factor)
+        self.d_inner = d_inner
 
         # Projection d'entrée
         self.in_proj = nn.Linear(d_model, d_inner * 2)
@@ -143,32 +144,33 @@ class SelectiveSSMBlock(nn.Module):
         # Activation
         x_conv = self.activation(x_conv)
 
-        # Scan SSM sélectif (simplifié comme gated unit + cumulative sum)
+        # Scan SSM sélectif (simplifié comme gated unit + element-wise state)
         # Calcul des matrices B et C de l'état
         B = self.B(x_conv)  # (batch, seq_len, d_state)
         C = self.C(x_conv)  # (batch, seq_len, d_state)
 
-        # État cumulatif simplifié (approximation du scan sélectif)
-        # h_t = A @ h_{t-1} + B @ x_t
-        h = torch.zeros(batch_size, self.d_model, self.d_state, device=x.device)
+        # Decay factor (sigmoid pour garder entre 0 et 1 → stabilité)
+        A_decay = torch.sigmoid(self.A)  # (d_inner, d_state)
+
+        # État cumulatif: h_t = A * h_{t-1} + B_t * x_t (element-wise)
+        h = torch.zeros(batch_size, self.d_inner, self.d_state, device=x.device)
         y_list = []
 
         for t in range(seq_len):
-            # Gradient à t
-            x_t = x_conv[:, t, :]  # (batch, d_inner)
-            B_t = B[:, t, :]  # (batch, d_state)
-            C_t = C[:, t, :]  # (batch, d_state)
+            x_t = x_conv[:, t, :]   # (batch, d_inner)
+            B_t = B[:, t, :]         # (batch, d_state)
+            C_t = C[:, t, :]         # (batch, d_state)
 
-            # Accumulation d'état (A @ h + B @ x)
-            h = torch.bmm(h, self.A.unsqueeze(0).expand(batch_size, -1, -1))
-            h = h + B_t.unsqueeze(1)  # Broadcast: (batch, d_inner, d_state)
+            # State update: decay + input injection
+            # h: (batch, d_inner, d_state)
+            # A_decay: (d_inner, d_state) → broadcast sur batch
+            # B_t: (batch, d_state) → (batch, 1, d_state)
+            # x_t: (batch, d_inner) → (batch, d_inner, 1)
+            h = h * A_decay.unsqueeze(0) + B_t.unsqueeze(1) * x_t.unsqueeze(2)
 
-            # Sortie: y = C @ h + D * x
-            y_t = torch.bmm(
-                C_t.unsqueeze(1),  # (batch, 1, d_state)
-                h  # (batch, d_inner, d_state)
-            ).squeeze(1)  # (batch, d_inner)
-            y_t = y_t + self.D.unsqueeze(0) * x_t
+            # Output: y_t = sum(C_t * h, dim=-1) + D * x_t
+            # C_t: (batch, d_state) → (batch, 1, d_state)
+            y_t = (C_t.unsqueeze(1) * h).sum(dim=-1) + self.D.unsqueeze(0) * x_t
 
             y_list.append(y_t)
 
