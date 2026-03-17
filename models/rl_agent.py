@@ -752,7 +752,7 @@ class RLTradingAgent:
                 gamma=0.97,                      # v5: 0.97 (horizon ~33 candles = 33h, adapté crypto 1h)
                 train_freq=1,                    # v5: update à chaque step
                 gradient_steps=2,                # v5: 2 gradient steps par update (apprend 2x plus vite)
-                ent_coef=0.2,                    # v5: démarrer plus bas (exploration modérée dès le début)
+                ent_coef="auto_0.2",             # v5: auto-tune en partant de 0.2 (pas fixe!)
                 target_entropy="auto",
                 policy_kwargs=policy_kwargs,
                 verbose=1,
