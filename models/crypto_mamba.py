@@ -120,50 +120,23 @@ class SelectiveSSMBlock(nn.Module):
     def _parallel_scan(A_decay: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         """
         Parallel prefix-sum scan sur GPU (algorithme Blelloch).
-        Calcule h_t = A * h_{t-1} + u_t pour toute la séquence en O(log T) étapes
-        au lieu de O(T) séquentiel.
-
-        Args:
-            A_decay: (batch, seq_len, d_inner, d_state) — decay factors par timestep
-            u: (batch, seq_len, d_inner, d_state) — inputs (B_t * x_t)
-
-        Returns:
-            h: (batch, seq_len, d_inner, d_state) — états cachés
+        Calcule h_t = A * h_{t-1} + u_t pour toute la séquence en O(log T) étapes.
+        Version optimisée mémoire : slicing au lieu de roll + mask.
         """
         T = A_decay.shape[1]
-
-        # Pad to power of 2 for efficient parallel scan
-        pad_len = 1
-        while pad_len < T:
-            pad_len *= 2
-
-        if pad_len > T:
-            pad_shape = list(A_decay.shape)
-            pad_shape[1] = pad_len - T
-            A_pad = torch.ones(pad_shape, device=A_decay.device, dtype=A_decay.dtype)
-            u_pad = torch.zeros(pad_shape, device=u.device, dtype=u.dtype)
-            A_decay = torch.cat([A_decay, A_pad], dim=1)
-            u = torch.cat([u, u_pad], dim=1)
-
-        # Up-sweep (reduce)
         h = u.clone()
         a = A_decay.clone()
 
-        steps = []
         stride = 1
-        while stride < pad_len:
-            steps.append(stride)
-            # h[i] = a[i] * h[i - stride] + h[i]  (pour i >= stride)
-            h_shifted = torch.roll(h, stride, dims=1)
-            a_shifted = torch.roll(a, stride, dims=1)
-            # Masquer les positions qui n'ont pas de prédécesseur valide
-            mask = torch.arange(pad_len, device=h.device) >= stride
-            mask = mask.view(1, -1, 1, 1)
-            h = torch.where(mask, a * h_shifted + h, h)
-            a = torch.where(mask, a * a_shifted, a)
+        while stride < T:
+            # Slicing direct : pas de roll ni masking (économie mémoire ~50%)
+            h_prev = h[:, :-stride].clone()
+            a_prev = a[:, :-stride].clone()
+            h[:, stride:] = a[:, stride:] * h_prev + h[:, stride:]
+            a[:, stride:] = a[:, stride:] * a_prev
             stride *= 2
 
-        return h[:, :T]
+        return h
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -208,9 +181,10 @@ class SelectiveSSMBlock(nn.Module):
         u = B.unsqueeze(2) * x_conv.unsqueeze(3)  # (b, T, d_inner, d_state)
 
         # A_decay broadcast : (batch, seq_len, d_inner, d_state)
-        A_expanded = A_decay.unsqueeze(0).unsqueeze(0).expand(
+        # expand() ne copie pas la mémoire, mais on a besoin de la forme complète pour le scan
+        A_expanded = A_decay.view(1, 1, *A_decay.shape).expand(
             batch_size, seq_len, -1, -1
-        )
+        ).contiguous()
 
         # Parallel scan : calcule tous les h_t en O(log T) au lieu de O(T)
         h_all = self._parallel_scan(A_expanded, u)  # (b, T, d_inner, d_state)
@@ -772,6 +746,10 @@ class MambaPredictor:
         """
         logger.info(f"Training CryptoMamba for {symbol}")
 
+        # Réduire la fragmentation VRAM (recommandé pour H100/B200)
+        import os
+        os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
         # Optimisation GPU : Tensor Cores (H100/B200/A100/RTX 3090+)
         torch.set_float32_matmul_precision('high')
 
@@ -817,17 +795,23 @@ class MambaPredictor:
             logger.info(f"GPU: {gpu_name} ({gpu_mem_gb:.0f} GB VRAM)")
 
         # Batch size adaptatif selon le GPU
+        # Le parallel scan SSM consomme beaucoup de VRAM (O(log T) copies de tenseurs 4D)
+        # On utilise un batch réel modéré + gradient accumulation pour l'effective batch
         if gpu_mem_gb >= 140:      # B200 (192GB), H200 (141GB)
-            optimal_batch = 512
+            optimal_batch = 64
+            grad_accum = 8          # effective batch = 512
         elif gpu_mem_gb >= 70:     # H100 (80GB), A100 (80GB)
-            optimal_batch = 256
+            optimal_batch = 48
+            grad_accum = 4          # effective batch = 192
         elif gpu_mem_gb >= 20:     # RTX 3090 (24GB), A5000 (24GB)
-            optimal_batch = 128
+            optimal_batch = 32
+            grad_accum = 4          # effective batch = 128
         else:
             optimal_batch = batch_size
+            grad_accum = 1
 
         actual_batch = max(batch_size, optimal_batch)
-        logger.info(f"Batch size: {actual_batch} (GPU: {gpu_mem_gb:.0f}GB)")
+        logger.info(f"Batch size: {actual_batch} x {grad_accum} accum = {actual_batch * grad_accum} effective (GPU: {gpu_mem_gb:.0f}GB)")
 
         # Nombre de workers pour le data loading
         import os
@@ -922,6 +906,7 @@ class MambaPredictor:
             enable_model_summary=True,
             log_every_n_steps=10,
             gradient_clip_val=grad_clip,
+            accumulate_grad_batches=grad_accum,
         )
 
         # Entraînement
