@@ -74,12 +74,7 @@ class CryptoTradingEnv(gym.Env):
         self.cvar_alpha = config.get("cvar_alpha", 0.05)  # 5% tail risk
         self.cvar_lambda = config.get("cvar_lambda", 0.5)  # poids de la pénalité CVaR
 
-        # Differential Sharpe Ratio state (EMA)
-        self.eta = 0.02  # v5: eta plus haut = EMA plus réactive (s'adapte plus vite)
-        self.A_prev = 0.0
-        self.B_prev = 0.0
-
-        # v5: Episode max length — des episodes plus courts = plus de diversité
+        # v6: Episode max length — des episodes plus courts = plus de diversité
         self.max_episode_length = config.get("max_episode_length", 2000)  # ~83 jours en 1h
 
         # Observation augmentee : features + portfolio state enrichi
@@ -87,8 +82,9 @@ class CryptoTradingEnv(gym.Env):
         n_extra = 10
         self.n_extra = n_extra
         obs_size = self.lookback * self.n_features + n_extra
+        # v6: bounds plus larges — VecNormalize s'occupe du scaling
         self.observation_space = spaces.Box(
-            low=-5.0, high=5.0,
+            low=-np.inf, high=np.inf,
             shape=(obs_size,),
             dtype=np.float32,
         )
@@ -128,10 +124,6 @@ class CryptoTradingEnv(gym.Env):
         self.n_losses = 0
         self.consecutive_wins = 0
         self.consecutive_losses = 0
-
-        # Reset DSR state
-        self.A_prev = 0.0
-        self.B_prev = 0.0
 
         obs = self._get_observation()
         return obs, {}
@@ -267,129 +259,50 @@ class CryptoTradingEnv(gym.Env):
 
     def _compute_reward(self, position_change: float) -> float:
         """
-        Reward v5.0 -- Multi-objectif optimisé 2025-2026.
+        Reward v6.0 -- Approche FinRL simplifiée qui marche.
 
-        6 composantes rééquilibrées (recherche: arxiv 2511.20678, MDPI 2024):
-          1. Profit direct (30%) — signal clair et immédiat
-          2. Differential Sharpe Ratio stabilisé (25%) — risk-adjusted
-          3. Drawdown penalty progressive (20%) — protège le capital
-          4. Transaction costs (10%) — anti-churning
-          5. CVaR tail risk penalty (8%) — protège contre les queues
-          6. Conviction & trend-following bonus (7%) — rewards holding winners
+        Basé sur les recherches FinRL, arxiv 2506.04358, et les gagnants
+        du FinRL Contest 2025 :
+          - Le reward principal = changement de valeur du portfolio (simple, clair)
+          - Léger penalty drawdown (protection capital)
+          - Léger penalty transaction costs (anti-churning)
 
-        Changements v5 vs v4:
-        - Ajout profit direct 30% : donne un signal clair dès le début (DSR seul est instable)
-        - DSR réduit de 60%→25% : encore utile mais ne domine plus le reward shaping
-        - DSR warmup : fallback linéaire pendant les 100 premiers steps (évite div/0)
-        - Drawdown progressive : 3 paliers au lieu d'un seul quadratique
-        - CVaR renforcé 5%→8% : meilleure protection tail risk
-        - Conviction améliorée : bonus proportionnel au PnL, pas juste au temps
+        Pourquoi simple > complexe :
+          - Le critic peut estimer les Q-values correctement
+          - Le reward scale est bien calibré pour SAC
+          - Pas de signal contradictoire entre composantes
+          - FinRL utilise exactement cette approche et obtient des Sharpe > 2.0
         """
-        if self.current_step < len(self.returns):
-            market_return = self.returns[self.current_step - 1]
+        prev_balance = self.portfolio_values[-1]
+
+        # ===================================================================
+        # REWARD PRINCIPAL : log return du portfolio
+        # C'est ce que FinRL et les implémentations qui marchent utilisent.
+        # Le log return est naturellement bien scaled pour SAC.
+        # Multiplié par 1000 pour que le signal soit dans un bon range.
+        # ===================================================================
+        if prev_balance > 0 and self.balance > 0:
+            log_return = np.log(self.balance / prev_balance)
         else:
-            market_return = 0.0
+            log_return = 0.0
 
-        # Return du step actuel
-        step_return = self.position * market_return
-
-        # ===================================================================
-        # 1. PROFIT DIRECT (30%) — signal clair et immédiat
-        # Avantage: l'agent comprend vite que position*return = argent
-        # Scaled pour être dans [-2, 2] avec des returns crypto typiques
-        # ===================================================================
-        reward_profit = float(np.clip(step_return * 100.0, -2.0, 2.0))
+        reward = log_return * 1000.0  # scale: 1% return = 10.0 reward
 
         # ===================================================================
-        # 2. DIFFERENTIAL SHARPE RATIO STABILISÉ (25%)
-        # DSR = d(Sharpe)/dt — optimise le risk-adjusted return
-        # NOUVEAU: warmup pendant 100 steps pour éviter instabilité initiale
-        # ===================================================================
-        A_new = self.A_prev + self.eta * (step_return - self.A_prev)
-        B_new = self.B_prev + self.eta * (step_return**2 - self.B_prev)
-
-        denominator = (B_new - A_new**2)
-        n_steps = len(self.returns_history)
-
-        if n_steps < 100:
-            # Warmup: utiliser un DSR simplifié pendant que les stats se stabilisent
-            # Proportionnel au step_return mais atténué par le ratio n/100
-            warmup_factor = n_steps / 100.0
-            dsr = step_return * 50.0 * warmup_factor
-        elif denominator > 1e-8:
-            dsr = (B_new * (step_return - self.A_prev) - 0.5 * A_new * (step_return**2 - self.B_prev)) / (denominator ** 1.5 + 1e-8)
-        else:
-            dsr = step_return * 50.0
-
-        self.A_prev = A_new
-        self.B_prev = B_new
-
-        reward_dsr = float(np.clip(dsr * 1.0, -2.0, 2.0))
-
-        # ===================================================================
-        # 3. DRAWDOWN PENALTY PROGRESSIVE (20%)
-        # 3 paliers: léger (<5%), modéré (5-15%), sévère (>15%)
-        # Plus réaliste que le quadratique pur
+        # PENALTY DRAWDOWN (léger) — protège le capital sans noyer le signal
+        # Seulement si drawdown > 10%, pénalité proportionnelle
         # ===================================================================
         current_dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
-        if current_dd > -0.05:
-            dd_penalty = current_dd * 5.0  # léger
-        elif current_dd > -0.15:
-            dd_penalty = -0.25 + (current_dd + 0.05) * 15.0  # modéré
-        else:
-            dd_penalty = -1.75 + (current_dd + 0.15) * 30.0  # sévère
-        reward_dd = float(np.clip(dd_penalty, -3.0, 0.0))
+        if current_dd < -0.10:
+            reward += current_dd * 5.0  # dd=-15% → reward -= 0.75
 
         # ===================================================================
-        # 4. TRANSACTION COSTS (10%) — anti-churning
-        # Pénalise les changements de position fréquents
+        # PENALTY TRANSACTION COSTS — anti-churning
+        # Pénalise les changements de position (scaled modérément)
         # ===================================================================
-        reward_cost = float(-0.03 * position_change)
+        reward -= position_change * 0.5
 
-        # ===================================================================
-        # 5. CVAR TAIL RISK PENALTY (8%)
-        # Penalise les returns dans le pire 5% de la distribution
-        # NOUVEAU: penalty proportionnelle à la distance au VaR
-        # ===================================================================
-        reward_cvar = 0.0
-        if len(self.returns_history) >= 30:
-            recent = np.array(self.returns_history[-100:])
-            var_threshold = np.percentile(recent, self.cvar_alpha * 100)
-            if step_return < var_threshold:
-                # Pénalité proportionnelle : plus on est loin du VaR, pire c'est
-                reward_cvar = float(np.clip((step_return - var_threshold) * 8.0, -2.0, 0.0))
-
-        # ===================================================================
-        # 6. CONVICTION & TREND-FOLLOWING BONUS (7%)
-        # Récompense la conviction (rester dans un trade gagnant)
-        # NOUVEAU: bonus proportionnel au unrealized PnL, pas juste au temps
-        # ===================================================================
-        reward_conviction = 0.0
-        # Bonus holding gagnant — proportionnel au PnL et au temps
-        if self.time_in_position > 2 and step_return > 0:
-            time_factor = min(self.time_in_position / 15.0, 1.0)
-            pnl_factor = min(abs(step_return) * 50.0, 1.0)
-            reward_conviction += 0.05 * time_factor * (1.0 + pnl_factor)
-        # Pénalité douce d'inaction (ne pas être flat trop longtemps)
-        if abs(self.position) < 0.05:
-            reward_conviction -= 0.02
-        # Bonus trend-following : reward si position est dans la même direction que le marché
-        if self.position * market_return > 0 and abs(self.position) > 0.2:
-            reward_conviction += 0.02
-
-        # ===================================================================
-        # COMBINAISON FINALE — rééquilibrée pour signal plus clair
-        # ===================================================================
-        reward = (
-            reward_profit * 0.30 +
-            reward_dsr * 0.25 +
-            reward_dd * 0.20 +
-            reward_cost * 0.10 +
-            reward_cvar * 0.08 +
-            reward_conviction * 0.07
-        )
-
-        return float(np.clip(reward, -5.0, 5.0))
+        return float(np.clip(reward, -10.0, 10.0))
 
     def render(self, mode="human"):
         dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
@@ -648,7 +561,9 @@ class RLTradingAgent:
                 env = SubprocVecEnv([self._make_env(train_feat, train_prices) for _ in range(n_envs)])
             else:
                 env = DummyVecEnv([self._make_env(train_feat, train_prices)])
-            env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+            # v6: norm_reward=False — le reward log-return est déjà bien scaled.
+            # Double-normaliser écrase le signal et empêche le critic d'apprendre.
+            env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
             # Validation env (toujours DummyVecEnv — pas besoin de paralléliser l'eval)
             val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val")])
@@ -744,17 +659,16 @@ class RLTradingAgent:
             )
             return SAC(
                 "MlpPolicy", env,
-                learning_rate=lr,                # actor lr = 1e-4
-                buffer_size=int(self.cfg.get("buffer_size", 200_000)),  # v5: 200k (données plus récentes)
-                learning_starts=int(self.cfg.get("learning_starts", 2000)),  # v5: démarrer plus tôt
-                batch_size=256,                  # v5: 256 (plus de variance dans les gradients)
+                learning_rate=3e-4,              # v6: 3e-4 standard SAC (meilleur que 1e-4 avec reward claire)
+                buffer_size=int(self.cfg.get("buffer_size", 200_000)),
+                learning_starts=int(self.cfg.get("learning_starts", 2000)),
+                batch_size=256,
                 tau=float(self.cfg.get("tau", 0.005)),
-                gamma=0.97,                      # v5: 0.97 (horizon ~33 candles = 33h, adapté crypto 1h)
-                train_freq=1,                    # v5: update à chaque step
-                gradient_steps=2,                # v5: 2 gradient steps par update (apprend 2x plus vite)
-                ent_coef="auto",                 # auto-tune l'entropie
-                target_entropy=-0.3,             # v5: -0.3 au lieu de -1.0 (auto). Garde plus d'exploration.
-                                                 # -1.0 (default) collapse l'entropie → overfit. -0.3 = sweet spot trading.
+                gamma=0.99,                      # v6: 0.99 — avec reward simple le gamma peut être plus haut
+                train_freq=1,
+                gradient_steps=1,                # v6: 1 suffit avec reward claire (pas besoin de compenser bruit)
+                ent_coef="auto",
+                target_entropy=-0.3,             # v6: garde exploration modérée (empêche entropy collapse)
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
@@ -773,15 +687,15 @@ class RLTradingAgent:
             )
             return PPO(
                 "MlpPolicy", env,
-                learning_rate=lr,
-                n_steps=4096,                  # v5: plus de data par update (meilleur GAE)
-                batch_size=512,                # v5: 512 (plus stable)
-                n_epochs=15,                   # v5: 15 epochs (exploitation plus poussée)
-                gamma=0.97,                    # v5: même horizon que SAC
-                gae_lambda=0.92,               # v5: 0.92 (bias vers l'exploitation, moins de variance)
-                clip_range=0.15,               # v5: clip plus serré (plus conservative updates)
-                ent_coef=0.005,                # v5: moins d'exploration que SAC
-                target_kl=0.015,               # v5: plus strict (early stopping plus agressif)
+                learning_rate=3e-4,            # v6: standard PPO lr
+                n_steps=2048,                  # v6: standard (plus de updates par epoch)
+                batch_size=256,
+                n_epochs=10,                   # v6: standard
+                gamma=0.99,                    # v6: 0.99 avec reward simple
+                gae_lambda=0.95,               # v6: standard GAE
+                clip_range=0.2,                # v6: standard clip
+                ent_coef=0.01,                 # v6: standard exploration
+                target_kl=0.02,                # v6: standard KL
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
@@ -803,14 +717,14 @@ class RLTradingAgent:
             )
             return DDPG(
                 "MlpPolicy", env,
-                learning_rate=lr,
-                buffer_size=int(self.cfg.get("buffer_size", 200_000)),  # v5: 200k
-                learning_starts=int(self.cfg.get("learning_starts", 2000)),  # v5: plus tôt
-                batch_size=256,                     # v5: 256
+                learning_rate=3e-4,                 # v6: standard
+                buffer_size=int(self.cfg.get("buffer_size", 200_000)),
+                learning_starts=int(self.cfg.get("learning_starts", 2000)),
+                batch_size=256,
                 tau=float(self.cfg.get("tau", 0.005)),
-                gamma=0.97,                         # v5: même horizon que SAC/PPO
-                train_freq=1,                       # v5: update chaque step
-                gradient_steps=2,                   # v5: 2 gradient steps
+                gamma=0.99,                         # v6: 0.99 avec reward simple
+                train_freq=1,
+                gradient_steps=1,                   # v6: 1 suffit
                 action_noise=action_noise,
                 policy_kwargs=policy_kwargs,
                 verbose=1,

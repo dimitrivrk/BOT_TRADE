@@ -142,10 +142,10 @@ models:
       - "PPO"              # Le plus stable et robuste
       - "DDPG"             # Le plus rapide, bon pour trends clairs
     # Params communs
-    learning_rate: 1e-4    # actor lr (critic lr séparé dans le code)
-    gamma: 0.97            # v5: horizon ~33 candles (adapté crypto 1h)
-    buffer_size: 200000    # v5: 200k (données plus récentes, moins de stale data)
-    learning_starts: 2000  # v5: démarrer plus tôt
+    learning_rate: 3e-4    # v6: standard SAC/PPO lr (override dans le code)
+    gamma: 0.99            # v6: 0.99 avec reward simple (log return)
+    buffer_size: 200000    # 200k (données récentes)
+    learning_starts: 2000
     tau: 0.005
     total_timesteps: 500000  # 500k steps par agent
     lookback: 48             # v5: 48 candles = 2 jours (plus de contexte)
