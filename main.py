@@ -166,7 +166,21 @@ def run_train(args):
 
                     # Utiliser les features selectionnees si dispo
                     rl_features = selected_features if len(selected_features.columns) <= 40 else features
-                    rl.train(rl_features, df)
+
+                    # Filtrage par date si configuré
+                    rl_cfg = config["models"]["rl"]
+                    rl_df = df.copy()
+                    if rl_cfg.get("train_start_date"):
+                        start = pd.Timestamp(rl_cfg["train_start_date"])
+                        rl_features = rl_features[rl_features.index >= start]
+                        rl_df = rl_df[rl_df.index >= start]
+                    if rl_cfg.get("train_end_date"):
+                        end = pd.Timestamp(rl_cfg["train_end_date"])
+                        rl_features = rl_features[rl_features.index <= end]
+                        rl_df = rl_df[rl_df.index <= end]
+                    logger.info(f"RL training data: {len(rl_features)} lignes ({rl_features.index.min()} → {rl_features.index.max()})")
+
+                    rl.train(rl_features, rl_df)
                 except Exception as e:
                     logger.error(f"RL training failed : {e}")
                     import traceback
