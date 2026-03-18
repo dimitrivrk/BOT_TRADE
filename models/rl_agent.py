@@ -1,12 +1,12 @@
 """
-Agent de Reinforcement Learning v4 pour le trading crypto.
+Agent de Reinforcement Learning v6 pour le trading crypto.
 
-Architecture état de l'art 2025-2026 :
+Architecture état de l'art 2025-2026 (approche FinRL) :
   - Ensemble de 3 agents : SAC + PPO + DDPG
-  - Reward v5.0 : Stabilized DSR + Profit + Drawdown + CVaR + Conviction
-  - Feature extractor SSM-inspired (State Space Model léger)
+  - Reward v6.0 : log return du portfolio (simple, clair, prouvé)
+  - Feature extractor SSM-inspired + temporal attention
   - Vote pondéré dynamique entre les 3 agents
-  - Hyperparams optimisés pour crypto 1h (gamma=0.97, separate critic lr)
+  - Hyperparams standard : lr=3e-4, gamma=0.99, target_entropy=-0.3
 """
 
 import numpy as np
@@ -71,8 +71,7 @@ class CryptoTradingEnv(gym.Env):
         self.initial_balance = config.get("initial_balance", 10000)
         self.transaction_cost = config.get("transaction_cost", 0.001)
         self.reward_type = config.get("reward_type", "risk_aware")
-        self.cvar_alpha = config.get("cvar_alpha", 0.05)  # 5% tail risk
-        self.cvar_lambda = config.get("cvar_lambda", 0.5)  # poids de la pénalité CVaR
+        # v6: cvar_alpha/cvar_lambda supprimés (reward simplifiée)
 
         # v6: Episode max length — des episodes plus courts = plus de diversité
         self.max_episode_length = config.get("max_episode_length", 2000)  # ~83 jours en 1h
