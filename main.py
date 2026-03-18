@@ -171,11 +171,11 @@ def run_train(args):
                     rl_cfg = config["models"]["rl"]
                     rl_df = df.copy()
                     if rl_cfg.get("train_start_date"):
-                        start = pd.Timestamp(rl_cfg["train_start_date"])
+                        start = pd.Timestamp(rl_cfg["train_start_date"], tz="UTC")
                         rl_features = rl_features[rl_features.index >= start]
                         rl_df = rl_df[rl_df.index >= start]
                     if rl_cfg.get("train_end_date"):
-                        end = pd.Timestamp(rl_cfg["train_end_date"])
+                        end = pd.Timestamp(rl_cfg["train_end_date"], tz="UTC")
                         rl_features = rl_features[rl_features.index <= end]
                         rl_df = rl_df[rl_df.index <= end]
                     logger.info(f"RL training data: {len(rl_features)} lignes ({rl_features.index.min()} → {rl_features.index.max()})")
