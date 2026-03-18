@@ -752,8 +752,9 @@ class RLTradingAgent:
                 gamma=0.97,                      # v5: 0.97 (horizon ~33 candles = 33h, adapté crypto 1h)
                 train_freq=1,                    # v5: update à chaque step
                 gradient_steps=2,                # v5: 2 gradient steps par update (apprend 2x plus vite)
-                ent_coef="auto",                 # v5: laisser SB3 choisir (démarre ~0.9, descend lentement)
-                target_entropy="auto",
+                ent_coef="auto",                 # auto-tune l'entropie
+                target_entropy=-0.3,             # v5: -0.3 au lieu de -1.0 (auto). Garde plus d'exploration.
+                                                 # -1.0 (default) collapse l'entropie → overfit. -0.3 = sweet spot trading.
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
