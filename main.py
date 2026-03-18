@@ -76,7 +76,20 @@ def run_download(args):
 
     collector = HistoricalDataCollector()
     pairs = args.pairs or config["trading"]["pairs"]
-    collector.fetch_all_pairs(pairs=pairs, days=args.days or 730)
+
+    # Si --start est fourni, télécharger depuis cette date pour chaque TF
+    if args.start:
+        tf_config = config["trading"]["timeframes"]
+        timeframes = [tf_config["primary"], tf_config["higher"]]
+        if tf_config.get("lower"):
+            timeframes.append(tf_config["lower"])
+        for symbol in pairs:
+            for tf in timeframes:
+                logger.info(f"Download {symbol}/{tf} depuis {args.start}...")
+                collector.fetch_pair(symbol, tf, days=9999, since_date=args.start)
+    else:
+        collector.fetch_all_pairs(pairs=pairs, days=args.days or 730)
+
     logger.info("Telechargement termine !")
 
 

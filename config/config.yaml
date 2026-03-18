@@ -135,7 +135,7 @@ models:
   rl:
     enabled: true
     train_start_date: "2023-01-01"   # Filtrer les données d'entraînement
-    train_end_date: "2024-12-31"     # Ne s'entraîner que sur 2023-2024
+    train_end_date: "2025-12-31"     # S'entraîner sur 2023-2024-2025
     # Ensemble complet : SAC + PPO + DDPG
     ensemble_agents:
       - "SAC"              # Meilleur en haute volatilite (max-entropy)
