@@ -285,7 +285,7 @@ class CryptoTradingEnv(gym.Env):
         else:
             log_return = 0.0
 
-        reward = log_return * 1000.0  # scale: 1% return = 10.0 reward
+        reward = log_return * 100.0  # scale: 1% return = 1.0 reward (×1000 divergeait)
 
         # ===================================================================
         # PENALTY DRAWDOWN (léger) — protège le capital sans noyer le signal
@@ -293,15 +293,15 @@ class CryptoTradingEnv(gym.Env):
         # ===================================================================
         current_dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
         if current_dd < -0.10:
-            reward += current_dd * 5.0  # dd=-15% → reward -= 0.75
+            reward += current_dd * 2.0  # dd=-15% → reward -= 0.30
 
         # ===================================================================
         # PENALTY TRANSACTION COSTS — anti-churning
         # Pénalise les changements de position (scaled modérément)
         # ===================================================================
-        reward -= position_change * 0.5
+        reward -= position_change * 0.1
 
-        return float(np.clip(reward, -10.0, 10.0))
+        return float(np.clip(reward, -5.0, 5.0))
 
     def render(self, mode="human"):
         dd = (self.balance - self.peak_balance) / (self.peak_balance + 1e-8)
@@ -658,7 +658,7 @@ class RLTradingAgent:
             )
             return SAC(
                 "MlpPolicy", env,
-                learning_rate=3e-4,              # v6: 3e-4 standard SAC (meilleur que 1e-4 avec reward claire)
+                learning_rate=1e-4,              # v6: 1e-4 (3e-4 divergeait avec reward ×100)
                 buffer_size=int(self.cfg.get("buffer_size", 200_000)),
                 learning_starts=int(self.cfg.get("learning_starts", 2000)),
                 batch_size=256,
@@ -686,7 +686,7 @@ class RLTradingAgent:
             )
             return PPO(
                 "MlpPolicy", env,
-                learning_rate=3e-4,            # v6: standard PPO lr
+                learning_rate=1e-4,            # v6: 1e-4 (stable avec reward ×100)
                 n_steps=2048,                  # v6: standard (plus de updates par epoch)
                 batch_size=256,
                 n_epochs=10,                   # v6: standard
@@ -716,7 +716,7 @@ class RLTradingAgent:
             )
             return DDPG(
                 "MlpPolicy", env,
-                learning_rate=3e-4,                 # v6: standard
+                learning_rate=1e-4,                 # v6: 1e-4 (stable)
                 buffer_size=int(self.cfg.get("buffer_size", 200_000)),
                 learning_starts=int(self.cfg.get("learning_starts", 2000)),
                 batch_size=256,
