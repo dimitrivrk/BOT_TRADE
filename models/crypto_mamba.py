@@ -1070,9 +1070,30 @@ class MambaPredictor:
                 return False
 
         try:
-            # Création du modèle
+            # 1. Charger le fichier d'abord pour extraire le state_dict
+            load_path = ckpt_path if load_from_ckpt else str(model_path)
+            raw = torch.load(load_path, map_location=self.device)
+
+            # 2. Extraire le state_dict (Lightning ou pur)
+            if isinstance(raw, dict) and "state_dict" in raw:
+                state_dict = raw["state_dict"]
+                # Retirer le prefix "model." (Lightning wraps le modèle)
+                clean_state = {}
+                for k, v in state_dict.items():
+                    new_key = k.replace("model.", "", 1) if k.startswith("model.") else k
+                    clean_state[new_key] = v
+            else:
+                clean_state = raw
+
+            # 3. Détecter input_dim depuis le checkpoint (évite le mismatch 84 vs 93)
+            input_dim = self.model_params.get('input_dim', 84)
+            if "input_embedding.weight" in clean_state:
+                input_dim = clean_state["input_embedding.weight"].shape[1]
+                logger.info(f"Detected input_dim={input_dim} from checkpoint")
+
+            # 4. Créer le modèle avec la bonne taille
             self.model = CryptoMambaNet(
-                input_dim=self.model_params.get('input_dim', 84),
+                input_dim=input_dim,
                 d_model=self.model_params.get('d_model', 128),
                 num_layers=self.model_params.get('num_layers', 2),
                 d_state=self.model_params.get('d_state', 16),
@@ -1083,24 +1104,9 @@ class MambaPredictor:
                 num_branches=self.model_params.get('num_branches', 3),
             )
 
-            # Charger le fichier (peut être un state_dict pur ou un Lightning checkpoint)
-            load_path = ckpt_path if load_from_ckpt else str(model_path)
-            raw = torch.load(load_path, map_location=self.device)
-
-            # Détecter si c'est un Lightning checkpoint (contient "state_dict" comme clé)
-            if isinstance(raw, dict) and "state_dict" in raw:
-                state_dict = raw["state_dict"]
-                # Retirer le prefix "model." (Lightning wraps le modèle dans un Module)
-                clean_state = {}
-                for k, v in state_dict.items():
-                    new_key = k.replace("model.", "", 1) if k.startswith("model.") else k
-                    clean_state[new_key] = v
-                self.model.load_state_dict(clean_state, strict=False)
-                logger.info(f"Model loaded from Lightning checkpoint: {load_path}")
-            else:
-                # State dict pur
-                self.model.load_state_dict(raw)
-                logger.info(f"Model loaded from {load_path}")
+            # 5. Charger les poids
+            self.model.load_state_dict(clean_state, strict=False)
+            logger.info(f"Model loaded from {load_path} (input_dim={input_dim})")
 
             self.model.to(self.device)
             self.model.eval()
