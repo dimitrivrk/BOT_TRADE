@@ -767,6 +767,9 @@ class MambaPredictor:
 
         logger.info(f"Mamba training: {numeric_df.shape[1]} features numériques (sur {features_df.shape[1]} totales)")
 
+        # Sauvegarder les noms des colonnes pour cohérence train/predict
+        self.feature_columns = list(numeric_df.columns)
+
         features = numeric_df.values.astype(np.float32)
         prices = prices_df.values.flatten().astype(np.float64)
 
@@ -961,9 +964,37 @@ class MambaPredictor:
                 'model': 'mamba',
             }
 
+        # Filtrer les colonnes pour matcher exactement celles du training
+        if hasattr(self, 'feature_columns') and self.feature_columns:
+            # Utiliser exactement les mêmes colonnes que pendant le training
+            available = [c for c in self.feature_columns if c in features_df.columns]
+            missing = [c for c in self.feature_columns if c not in features_df.columns]
+            numeric_df = features_df[available].copy()
+            # Ajouter les colonnes manquantes avec des 0
+            for col in missing:
+                numeric_df[col] = 0.0
+            # Réordonner pour matcher l'ordre du training
+            numeric_df = numeric_df[self.feature_columns]
+        else:
+            # Fallback: même logique que train()
+            numeric_df = features_df.select_dtypes(include=[np.number])
+            numeric_df = numeric_df.dropna(axis=1, how='all')
+
+        numeric_df = numeric_df.fillna(0.0)
+        numeric_df = numeric_df.replace([np.inf, -np.inf], 0.0)
+        features = numeric_df.values.astype(np.float64)
+
         # Normalisation
-        features = features_df.values.astype(np.float64)
         if self.scaler is not None:
+            if features.shape[1] != len(self.scaler.mean_):
+                logger.warning(f"Feature mismatch: {features.shape[1]} vs scaler {len(self.scaler.mean_)}, "
+                              f"ajustement automatique")
+                n_scaler = len(self.scaler.mean_)
+                if features.shape[1] > n_scaler:
+                    features = features[:, :n_scaler]
+                else:
+                    padding = np.zeros((features.shape[0], n_scaler - features.shape[1]))
+                    features = np.hstack([features, padding])
             features = self.scaler.transform(features)
         else:
             # Pas de scaler sauvé → normaliser à la volée (z-score sur la fenêtre)
@@ -1034,14 +1065,17 @@ class MambaPredictor:
         torch.save(self.model.state_dict(), model_path)
         logger.info(f"Model saved to {model_path}")
 
-        # Sauvegarde du scaler
+        # Sauvegarde du scaler + noms de colonnes
         scaler_path = symbol_dir / f"scaler_{safe_symbol}.npy"
         if self.scaler is not None:
-            np.save(scaler_path, {
+            scaler_data = {
                 'mean': self.scaler.mean_,
                 'scale': self.scaler.scale_,
-            })
-            logger.info(f"Scaler saved to {scaler_path}")
+            }
+            if hasattr(self, 'feature_columns') and self.feature_columns:
+                scaler_data['feature_columns'] = self.feature_columns
+            np.save(scaler_path, scaler_data)
+            logger.info(f"Scaler saved to {scaler_path} ({len(self.scaler.mean_)} features)")
 
     def load(self, symbol: str) -> bool:
         """
@@ -1131,7 +1165,9 @@ class MambaPredictor:
                 self.scaler = StandardScaler()
                 self.scaler.mean_ = scaler_data['mean']
                 self.scaler.scale_ = scaler_data['scale']
-                logger.info(f"Scaler loaded from {scaler_path}")
+                # Charger les noms de colonnes si disponibles
+                self.feature_columns = scaler_data.get('feature_columns', [])
+                logger.info(f"Scaler loaded from {scaler_path} ({len(self.scaler.mean_)} features)")
             except Exception as e:
                 logger.error(f"Error loading scaler: {e}")
 
