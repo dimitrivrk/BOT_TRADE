@@ -1045,17 +1045,24 @@ class MambaPredictor:
         symbol_dir = self.checkpoint_dir / symbol
         safe_symbol = symbol.replace("/", "_")
 
-        # Chercher le modèle : .pt d'abord, puis .ckpt Lightning
+        # Chercher le modèle : .pt d'abord, puis .ckpt Lightning (récursif)
         model_path = symbol_dir / f"mamba_{safe_symbol}_final.pt"
         ckpt_path = None
         load_from_ckpt = False
 
         if not model_path.exists():
-            # Fallback : chercher le best checkpoint Lightning
+            # Fallback : chercher les .ckpt récursivement (Lightning les met dans des sous-dossiers)
             import glob
-            ckpt_files = sorted(glob.glob(str(symbol_dir / "*.ckpt")))
-            if ckpt_files:
-                ckpt_path = ckpt_files[-1]  # dernier (souvent le best)
+            ckpt_files = sorted(glob.glob(str(symbol_dir / "**" / "*.ckpt"), recursive=True))
+            # Aussi chercher directement dans le dossier
+            ckpt_files += sorted(glob.glob(str(symbol_dir / "*.ckpt")))
+            # Aussi chercher les .pt (le user peut avoir copié manuellement)
+            pt_files = sorted(glob.glob(str(symbol_dir / "*.pt")))
+            if pt_files:
+                model_path = Path(pt_files[-1])
+                logger.info(f"Found .pt file: {model_path}")
+            elif ckpt_files:
+                ckpt_path = ckpt_files[-1]  # dernier = souvent le best
                 load_from_ckpt = True
                 logger.info(f"Using Lightning checkpoint: {ckpt_path}")
             else:
