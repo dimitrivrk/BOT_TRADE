@@ -136,24 +136,26 @@ models:
     enabled: true
     train_start_date: "2023-01-01"   # Filtrer les données d'entraînement
     train_end_date: "2025-12-31"     # S'entraîner sur 2023-2024-2025
-    # Ensemble SOTA : PPO + DQN + SAC (FinRL Contest approach)
+    # Ensemble EXACT SOTA FinRL Contest 2024 (SZU-Fin-621 gagnants)
+    # PPO-Switch : 2 PPO (aggressive + conservative) + DQN discret
+    # Majority voting sur les actions (Short/Hold/Long)
     ensemble_agents:
-      - "PPO"              # Le plus stable et robuste (pas de pb d'entropie)
-      - "DQN"              # Actions discrètes Short/Hold/Long (gagnants FinRL 2024)
-      - "SAC"              # Max-entropy, bon en haute volatilité (ent_coef fixe)
+      - "PPO_AGGRESSIVE"     # PPO rapide : lr=3e-4, plus d'exploration
+      - "PPO_CONSERVATIVE"   # PPO stable : lr=5e-5, exploite plus
+      - "DQN"                # DQN epsilon-greedy, actions discrètes
     # Params communs
-    learning_rate: 1e-4    # v7: 1e-4 stable pour tous les agents
+    learning_rate: 1e-4      # Override dans _create_model par agent
     gamma: 0.99
     buffer_size: 200000
     learning_starts: 2000
     tau: 0.005
-    total_timesteps: 150000  # SOTA: 150k (Sharpe stabilise à ~100k, au-delà = overfit)
+    total_timesteps: 150000  # SOTA: 150k (Sharpe stabilise à ~100k)
     lookback: 48             # 48 candles = 2 jours
     checkpoint_dir: "checkpoints/rl"
-    n_envs: 24               # envs paralleles (SubprocVecEnv)
-    eval_freq: 500           # eval fréquent (~12k steps) pour capturer le best model tôt
+    n_envs: 28               # 28 envs parallèles (optimisé 31 vCPU, 3 pour système)
+    eval_freq: 500           # eval fréquent (~14k steps)
     n_eval_episodes: 3
-    feature_extractor: "ssm" # ssm = Conv1D multi-scale + temporal attention
+    feature_extractor: "mlp" # v8: MLP rapide (PPO sur CPU, pas besoin de SSM lourd)
     env:
       initial_balance: 10000
       max_position_pct: 0.5

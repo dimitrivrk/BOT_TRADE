@@ -1,13 +1,14 @@
 """
-Agent de Reinforcement Learning v7 pour le trading crypto.
+Agent de Reinforcement Learning v8 pour le trading crypto.
 
-Architecture SOTA FinRL Contest 2024-2025 :
-  - Ensemble de 3 agents : PPO + DQN + SAC
-  - Actions discrètes pour DQN (Short/Hold/Long) — plus stable que continuous
-  - Training sur fenêtres glissantes de 6 mois (capture le régime actuel)
-  - Reward v6 : log return portfolio (simple, prouvé, Sharpe > 2.0)
-  - Ensemble switch : vote pondéré par Sharpe récent de chaque agent
-  - 150k timesteps max (Sharpe se stabilise à ~100k, au-delà = overfit)
+Architecture EXACTE FinRL Contest 2024 gagnants (SZU-Fin-621) :
+  - PPO-Switch : 2 PPO (aggressive + conservative) + DQN discret
+  - MAJORITY VOTING sur les actions (pas vote pondéré continu)
+  - Actions discrètes pour TOUS les agents (Short/Hold/Long)
+  - Reward = log return portfolio (simple, prouvé)
+  - 150k timesteps max (Sharpe stabilise à ~100k)
+  - 28 envs parallèles pour PPO (optimisé 31 vCPU)
+  - PAS de SAC (instable en trading, entropy collapse)
 """
 
 import numpy as np
@@ -20,14 +21,13 @@ from pathlib import Path
 import yaml
 import pickle
 
-from stable_baselines3 import PPO, SAC, DDPG, DQN
+from stable_baselines3 import PPO, DQN
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
     EvalCallback, CheckpointCallback, BaseCallback
 )
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
 
 import torch.nn as nn
 from utils.logger import setup_logger
@@ -624,7 +624,7 @@ class RLTradingAgent:
     Basé sur FinRL ensemble framework (AI4Finance, Columbia).
     """
 
-    ALGOS = {"SAC": SAC, "PPO": PPO, "DDPG": DDPG, "DQN": DQN}
+    ALGOS = {"PPO": PPO, "PPO_AGGRESSIVE": PPO, "PPO_CONSERVATIVE": PPO, "DQN": DQN}
 
     def __init__(self, config_path: str = "config/config.yaml"):
         with open(config_path) as f:
@@ -636,22 +636,20 @@ class RLTradingAgent:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Ensemble config
-        ensemble_cfg = self.cfg.get("ensemble_agents", ["SAC"])
+        ensemble_cfg = self.cfg.get("ensemble_agents", ["PPO_AGGRESSIVE", "PPO_CONSERVATIVE", "DQN"])
         self.agent_names = ensemble_cfg if isinstance(ensemble_cfg, list) else [ensemble_cfg]
 
-        self.models = {}  # {"SAC": model, "PPO": model, "DDPG": model}
+        self.models = {}
         self.agent_weights = {name: 1.0 / len(self.agent_names) for name in self.agent_names}
 
         # Compatibilité avec l'ancienne interface (single model)
         self.model = None
-        self.algo_name = self.agent_names[0] if self.agent_names else "SAC"
+        self.algo_name = self.agent_names[0] if self.agent_names else "PPO_AGGRESSIVE"
 
-    def _make_env(self, features_df, prices_df, mode="train", discrete=False):
+    def _make_env(self, features_df, prices_df, mode="train"):
+        """Crée un env discret (Short/Hold/Long) — approche SOTA FinRL Contest."""
         def _init():
-            if discrete:
-                env = CryptoTradingEnvDiscrete(features_df, prices_df, self.env_cfg, mode=mode)
-            else:
-                env = CryptoTradingEnv(features_df, prices_df, self.env_cfg, mode=mode)
+            env = CryptoTradingEnvDiscrete(features_df, prices_df, self.env_cfg, mode=mode)
             env = Monitor(env)
             return env
         return _init
@@ -705,23 +703,23 @@ class RLTradingAgent:
             logger.info(f"Entraînement {algo_name} ({total_timesteps:,} timesteps)")
             logger.info(f"{'='*60}")
 
-            # DQN utilise l'env discrète (Short/Hold/Long)
-            is_discrete = (algo_name == "DQN")
+            # v8 SOTA: Tous les agents en discret (Short/Hold/Long)
+            # PPO: 28 envs parallèles (on-policy, bénéficie du parallélisme)
+            # DQN: 1 env (off-policy, replay buffer, pas besoin de parallel)
+            is_on_policy = algo_name.startswith("PPO")
 
-            # Envs parallèles (SubprocVecEnv = 1 process par env = N cores utilisés)
-            if n_envs > 1 and algo_name != "DQN":
-                # DQN n'utilise pas SubprocVecEnv (replay buffer, pas besoin de parallel rollout)
-                env = SubprocVecEnv([self._make_env(train_feat, train_prices, discrete=is_discrete) for _ in range(n_envs)])
+            if is_on_policy and n_envs > 1:
+                env = SubprocVecEnv([self._make_env(train_feat, train_prices) for _ in range(n_envs)])
             else:
-                env = DummyVecEnv([self._make_env(train_feat, train_prices, discrete=is_discrete)])
+                env = DummyVecEnv([self._make_env(train_feat, train_prices)])
             env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
-            # Validation env
-            val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val", discrete=is_discrete)])
+            # Validation env (toujours 1 env)
+            val_env = DummyVecEnv([self._make_env(val_feat, val_prices, mode="val")])
             val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, training=False)
 
-            # Feature extractor : MLP (rapide) ou SSM (precis)
-            n_extra = 10  # 10 portfolio state features
+            # Feature extractor : MLP (rapide) ou SSM (précis)
+            n_extra = 5  # v8: 5 portfolio state features (env discrète)
             if fe_type == "mlp":
                 fe_class = MLPFeaturesExtractor
                 fe_kwargs = dict(lookback=lookback, n_extra=n_extra, features_dim=128)
@@ -781,7 +779,7 @@ class RLTradingAgent:
                 torch.cuda.empty_cache()
 
         # Recharger tous les modèles depuis le disque (évite les thread locks en mémoire)
-        algo_classes = {"SAC": SAC, "PPO": PPO, "DDPG": DDPG, "DQN": DQN}
+        algo_classes = {"PPO_AGGRESSIVE": PPO, "PPO_CONSERVATIVE": PPO, "DQN": DQN}
         for algo_name in self.agent_names:
             algo_ckpt = self.checkpoint_dir / algo_name.lower()
             model_path = algo_ckpt / "final_model.zip"
@@ -797,94 +795,68 @@ class RLTradingAgent:
         return self.models
 
     def _create_model(self, algo_name, env, lr, lookback, n_extra, fe_kwargs, fe_class=None):
-        """Crée un modèle SB3 selon le nom de l'algorithme."""
+        """
+        Crée un modèle SB3 — approche SOTA FinRL Contest 2024.
+        3 agents en actions discrètes (Short/Hold/Long) :
+          - PPO_AGGRESSIVE : lr=3e-4, ent=0.02, explore plus
+          - PPO_CONSERVATIVE : lr=5e-5, ent=0.005, exploite plus
+          - DQN : epsilon-greedy, vanilla DQN
+        """
         if fe_class is None:
             fe_class = MLPFeaturesExtractor
 
-        if algo_name == "SAC":
+        if algo_name == "PPO_AGGRESSIVE":
+            # PPO agressif : explore plus, apprend vite
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
-                net_arch=[256, 128],             # SOTA: moins profond = moins d'overfit
-                activation_fn=nn.ReLU,
-            )
-            return SAC(
-                "MlpPolicy", env,
-                learning_rate=1e-4,
-                buffer_size=int(self.cfg.get("buffer_size", 200_000)),
-                learning_starts=int(self.cfg.get("learning_starts", 2000)),
-                batch_size=256,
-                tau=float(self.cfg.get("tau", 0.005)),
-                gamma=0.99,
-                train_freq=1,
-                gradient_steps=1,
-                ent_coef=0.1,                    # SOTA: FIXE à 0.1 — "auto" collapse TOUJOURS en trading
-                                                 # 0.1 = exploration modérée permanente, pas de collapse
-                policy_kwargs=policy_kwargs,
-                verbose=1,
-                tensorboard_log="logs/tensorboard/rl",
-                device="auto",
-            )
-
-        elif algo_name == "PPO":
-            policy_kwargs = dict(
-                features_extractor_class=fe_class,
-                features_extractor_kwargs=fe_kwargs,
-                net_arch=dict(
-                    pi=[256, 128],             # SOTA: moins profond = moins d'overfit
-                    vf=[256, 128],
-                ),
+                net_arch=dict(pi=[256, 128], vf=[256, 128]),
                 activation_fn=nn.ReLU,
             )
             return PPO(
                 "MlpPolicy", env,
-                learning_rate=1e-4,            # v6: 1e-4 (stable avec reward ×100)
-                n_steps=2048,                  # v6: standard (plus de updates par epoch)
+                learning_rate=3e-4,              # Agressif : lr haut
+                n_steps=2048,
                 batch_size=256,
-                n_epochs=10,                   # v6: standard
-                gamma=0.99,                    # v6: 0.99 avec reward simple
-                gae_lambda=0.95,               # v6: standard GAE
-                clip_range=0.2,                # v6: standard clip
-                ent_coef=0.01,                 # v6: standard exploration
-                target_kl=0.02,                # v6: standard KL
+                n_epochs=10,
+                gamma=0.99,
+                gae_lambda=0.95,
+                clip_range=0.2,
+                ent_coef=0.02,                   # Plus d'exploration
+                target_kl=0.03,                  # Plus permissif
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
-                device="auto",
+                device="cpu",                    # PPO est plus rapide sur CPU (SB3 warning)
             )
 
-        elif algo_name == "DDPG":
-            # DDPG avec Ornstein-Uhlenbeck noise pour l'exploration
-            n_actions = 1
-            action_noise = OrnsteinUhlenbeckActionNoise(
-                mean=np.zeros(n_actions),
-                sigma=0.15 * np.ones(n_actions),   # v5: sigma réduit (moins de bruit)
-            )
+        elif algo_name == "PPO_CONSERVATIVE":
+            # PPO conservatif : exploite plus, plus stable
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
-                net_arch=[256, 128],                # SOTA: moins profond
+                net_arch=dict(pi=[128, 64], vf=[128, 64]),   # Réseau plus petit
                 activation_fn=nn.ReLU,
             )
-            return DDPG(
+            return PPO(
                 "MlpPolicy", env,
-                learning_rate=1e-4,                 # v6: 1e-4 (stable)
-                buffer_size=int(self.cfg.get("buffer_size", 200_000)),
-                learning_starts=int(self.cfg.get("learning_starts", 2000)),
-                batch_size=256,
-                tau=float(self.cfg.get("tau", 0.005)),
-                gamma=0.99,                         # v6: 0.99 avec reward simple
-                train_freq=1,
-                gradient_steps=1,                   # v6: 1 suffit
-                action_noise=action_noise,
+                learning_rate=5e-5,              # Conservatif : lr bas
+                n_steps=4096,                    # Plus de data avant update
+                batch_size=512,
+                n_epochs=5,                      # Moins d'epochs (moins d'overfit)
+                gamma=0.99,
+                gae_lambda=0.98,                 # GAE plus haut = bias vers long terme
+                clip_range=0.15,                 # Clip plus serré
+                ent_coef=0.005,                  # Moins d'exploration
+                target_kl=0.01,                  # Plus strict
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
-                device="auto",
+                device="cpu",
             )
 
         elif algo_name == "DQN":
-            # DQN avec Double-DQN — actions discrètes (Short/Hold/Long)
+            # DQN — actions discrètes, epsilon-greedy
             # Approche gagnants FinRL Contest 2024 pour le crypto
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
@@ -902,14 +874,14 @@ class RLTradingAgent:
                 gamma=0.99,
                 train_freq=4,
                 gradient_steps=1,
-                target_update_interval=1000,     # Update target network every 1000 steps
-                exploration_fraction=0.3,         # Explore 30% du training
+                target_update_interval=1000,
+                exploration_fraction=0.3,         # 30% du training en exploration
                 exploration_initial_eps=1.0,
-                exploration_final_eps=0.05,       # 5% exploration à la fin
+                exploration_final_eps=0.05,
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
-                device="auto",
+                device="auto",                    # DQN bénéficie du GPU
             )
 
         else:
@@ -925,10 +897,9 @@ class RLTradingAgent:
             vec_norm_path = self.checkpoint_dir / algo_name.lower() / "vec_normalize.pkl"
             if vec_norm_path.exists():
                 try:
-                    # DQN utilise l'env discrète
-                    env_cls = CryptoTradingEnvDiscrete if algo_name == "DQN" else CryptoTradingEnv
+                    # v8: Tous les agents utilisent l'env discrète
                     dummy_env = DummyVecEnv([
-                        lambda: env_cls(
+                        lambda: CryptoTradingEnvDiscrete(
                             features_df.tail(lookback + 10),
                             prices_df.tail(lookback + 10),
                             self.env_cfg, mode="inference"
@@ -960,8 +931,8 @@ class RLTradingAgent:
         if not self.models:
             self.load()
 
-        lookback = self.cfg.get("lookback", 20)
-        n_extra = 10  # 10 portfolio state features
+        lookback = self.cfg.get("lookback", 48)
+        n_extra = 5  # v8: 5 portfolio state features (env discrète)
 
         # Charger VecNormalize une seule fois
         self._load_vec_normalizers(features_df, prices_df)
@@ -982,92 +953,66 @@ class RLTradingAgent:
         feat_window = np.nan_to_num(feat_window, nan=0.0, posinf=5.0, neginf=-5.0)
         flat = feat_window.flatten()
 
-        # Portfolio state features (valeurs neutres pour l'inference ponctuelle)
+        # Volatilité récente pour les extras
         if len(prices_df) >= 20:
             recent_returns = np.diff(np.log(prices_df['close'].values[-21:].astype(np.float64)))
             recent_vol = float(np.std(recent_returns)) if len(recent_returns) > 1 else 0.0
         else:
             recent_vol = 0.0
 
-        extras = np.array([
-            0.0,                                        # 1. position neutre
-            0.0,                                        # 2. pas de drawdown
-            np.clip(recent_vol * 100, 0.0, 5.0),       # 3. volatilite realisee
-            0.0,                                        # 4. pas de temps dans position
-            0.0,                                        # 5. unrealized PnL
-            0.0,                                        # 6. rolling sharpe
-            0.0,                                        # 7. win rate neutre
-            0.0,                                        # 8. consecutive wins
-            0.0,                                        # 9. consecutive losses
-            0.0,                                        # 10. total return
-        ], dtype=np.float32)
-
-        raw_obs = np.concatenate([flat, extras]).astype(np.float32)
-
         # Collecter les prédictions de chaque agent
         agent_predictions = {}
 
+        # v8: Tous les agents sont en discret — obs identique (5 extras)
+        extras_discrete = np.array([
+            0.0,                                        # position neutre
+            0.0,                                        # pas de drawdown
+            np.clip(recent_vol * 100, 0.0, 5.0),       # volatilité
+            0.0,                                        # unrealized_pnl
+            0.0,                                        # total_return
+        ], dtype=np.float32)
+        obs_discrete = np.concatenate([flat, extras_discrete]).astype(np.float32)
+
         for algo_name, model in self.models.items():
             try:
-                # DQN utilise un obs différent (5 extras au lieu de 10, env discrète)
-                if algo_name == "DQN":
-                    extras_dqn = np.array([
-                        0.0,                                        # position
-                        0.0,                                        # drawdown
-                        np.clip(recent_vol * 100, 0.0, 5.0),       # volatilité
-                        0.0,                                        # unrealized_pnl
-                        0.0,                                        # total_return
-                    ], dtype=np.float32)
-                    obs = np.concatenate([flat, extras_dqn]).astype(np.float32)
-                else:
-                    obs = raw_obs.copy()
+                obs = obs_discrete.copy()
 
                 # Normaliser via VecNormalize caché
                 if hasattr(self, '_vec_norms') and algo_name in self._vec_norms:
                     obs = self._vec_norms[algo_name].normalize_obs(obs)
 
-                # Prédire — SB3 attend (1, obs_dim) et retourne (1, action_dim)
+                # Prédire — tous les agents retournent une action discrète (0/1/2)
                 obs_2d = obs.reshape(1, -1)
                 action, _ = model.predict(obs_2d, deterministic=deterministic)
 
-                # DQN retourne un int (0=Short, 1=Hold, 2=Long) → convertir en position
-                if algo_name == "DQN":
-                    dqn_map = {0: -1.0, 1: 0.0, 2: 1.0}
-                    position = dqn_map.get(int(action.flatten()[0]), 0.0)
-                else:
-                    position = float(np.clip(action.flatten()[0], -1.0, 1.0))
-
-                agent_predictions[algo_name] = position
+                # Convertir action discrète → direction (-1, 0, +1)
+                action_map = {0: -1, 1: 0, 2: 1}
+                agent_predictions[algo_name] = action_map.get(int(action.flatten()[0]), 0)
 
             except Exception as e:
                 logger.warning(f"{algo_name} predict failed : {e}")
-                agent_predictions[algo_name] = 0.0
+                agent_predictions[algo_name] = 0
 
-        # Ensemble vote pondéré
+        # ================================================================
+        # MAJORITY VOTING — approche exacte des gagnants FinRL Contest 2024
+        # Chaque agent vote Short(-1), Hold(0) ou Long(+1)
+        # L'action majoritaire gagne
+        # ================================================================
         if not agent_predictions:
             return {"direction": 0, "confidence": 0.0, "position": 0.0, "model": "rl_ensemble"}
 
-        weighted_position = sum(
-            self.agent_weights.get(name, 1.0 / len(agent_predictions)) * pos
-            for name, pos in agent_predictions.items()
-        )
-        weighted_position /= sum(
-            self.agent_weights.get(name, 1.0 / len(agent_predictions))
-            for name in agent_predictions
-        )
-
-        direction = 1 if weighted_position > 0.1 else (-1 if weighted_position < -0.1 else 0)
-        confidence = min(abs(weighted_position), 1.0)
-
-        # Bonus de confiance si les agents sont d'accord
-        signs = [1 if p > 0.1 else (-1 if p < -0.1 else 0) for p in agent_predictions.values()]
-        agreement = abs(sum(signs)) / max(len(signs), 1)
-        confidence = min(confidence * (0.5 + 0.5 * agreement), 1.0)
+        votes = list(agent_predictions.values())
+        # Compter les votes
+        vote_counts = {-1: votes.count(-1), 0: votes.count(0), 1: votes.count(1)}
+        # Direction = vote majoritaire
+        direction = max(vote_counts, key=vote_counts.get)
+        # Confiance = proportion d'accord (3/3 = 1.0, 2/3 = 0.67, 1/3 = 0.33)
+        confidence = vote_counts[direction] / max(len(votes), 1)
 
         return {
             "direction": direction,
             "confidence": confidence,
-            "position": float(weighted_position),
+            "position": float(direction),
             "model": "rl_ensemble",
             "agent_votes": agent_predictions,
         }
