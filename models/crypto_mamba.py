@@ -1019,16 +1019,17 @@ class MambaPredictor:
             logger.warning("No model to save")
             return
 
+        safe_symbol = symbol.replace("/", "_")  # BTC/USDT → BTC_USDT (safe pour filename)
         symbol_dir = self.checkpoint_dir / symbol
         symbol_dir.mkdir(parents=True, exist_ok=True)
 
         # Sauvegarde du modèle
-        model_path = symbol_dir / f"mamba_{symbol}_final.pt"
+        model_path = symbol_dir / f"mamba_{safe_symbol}_final.pt"
         torch.save(self.model.state_dict(), model_path)
         logger.info(f"Model saved to {model_path}")
 
         # Sauvegarde du scaler
-        scaler_path = symbol_dir / f"scaler_{symbol}.npy"
+        scaler_path = symbol_dir / f"scaler_{safe_symbol}.npy"
         if self.scaler is not None:
             np.save(scaler_path, {
                 'mean': self.scaler.mean_,
@@ -1039,20 +1040,27 @@ class MambaPredictor:
     def load(self, symbol: str) -> bool:
         """
         Charge le modèle et le scaler.
-
-        Args:
-            symbol: Symbole de la cryptomonnaie
-
-        Returns:
-            True si le chargement a réussi, False sinon
+        Cherche d'abord le .pt (save()), puis les .ckpt (Lightning ModelCheckpoint).
         """
         symbol_dir = self.checkpoint_dir / symbol
+        safe_symbol = symbol.replace("/", "_")
 
-        # Chargement du modèle
-        model_path = symbol_dir / f"mamba_{symbol}_final.pt"
+        # Chercher le modèle : .pt d'abord, puis .ckpt Lightning
+        model_path = symbol_dir / f"mamba_{safe_symbol}_final.pt"
+        ckpt_path = None
+        load_from_ckpt = False
+
         if not model_path.exists():
-            logger.warning(f"Model file not found: {model_path}")
-            return False
+            # Fallback : chercher le best checkpoint Lightning
+            import glob
+            ckpt_files = sorted(glob.glob(str(symbol_dir / "*.ckpt")))
+            if ckpt_files:
+                ckpt_path = ckpt_files[-1]  # dernier (souvent le best)
+                load_from_ckpt = True
+                logger.info(f"Using Lightning checkpoint: {ckpt_path}")
+            else:
+                logger.warning(f"No model found in {symbol_dir}")
+                return False
 
         try:
             # Création du modèle
@@ -1068,18 +1076,32 @@ class MambaPredictor:
                 num_branches=self.model_params.get('num_branches', 3),
             )
 
-            # Chargement des poids
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            if load_from_ckpt:
+                # Lightning checkpoint : les poids sont sous "state_dict" avec prefix "model."
+                ckpt = torch.load(ckpt_path, map_location=self.device)
+                state_dict = ckpt.get('state_dict', ckpt)
+                # Retirer le prefix "model." si présent (Lightning wraps le modèle)
+                clean_state = {}
+                for k, v in state_dict.items():
+                    new_key = k.replace("model.", "", 1) if k.startswith("model.") else k
+                    clean_state[new_key] = v
+                self.model.load_state_dict(clean_state, strict=False)
+                logger.info(f"Model loaded from Lightning checkpoint: {ckpt_path}")
+            else:
+                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                logger.info(f"Model loaded from {model_path}")
+
             self.model.to(self.device)
             self.model.eval()
 
-            logger.info(f"Model loaded from {model_path}")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
         # Chargement du scaler
-        scaler_path = symbol_dir / f"scaler_{symbol}.npy"
+        scaler_path = symbol_dir / f"scaler_{safe_symbol}.npy"
         if scaler_path.exists():
             try:
                 scaler_data = np.load(scaler_path, allow_pickle=True).item()
