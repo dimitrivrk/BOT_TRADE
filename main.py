@@ -193,6 +193,61 @@ def run_train(args):
                         rl_df = rl_df[rl_df.index <= end]
                     logger.info(f"RL training data: {len(rl_features)} lignes ({rl_features.index.min()} → {rl_features.index.max()})")
 
+                    # === SOTA: Injecter les prédictions Mamba comme features pour le RL ===
+                    # L'agent RL reçoit la prédiction de direction du Mamba en input
+                    # → il n'a plus besoin de deviner la direction, juste quand/combien trader
+                    try:
+                        from models.crypto_mamba import MambaPredictor
+                        mamba_pred = MambaPredictor()
+                        mamba_pred.load(symbol.replace("/", ""))
+
+                        if mamba_pred.model is not None:
+                            logger.info("Génération des prédictions Mamba pour le RL...")
+                            lookback_mamba = mamba_pred.model_params.get('lookback', 168)
+
+                            # Batch predict sur tout le dataset
+                            mamba_directions = []
+                            mamba_confidences = []
+                            mamba_returns_h1 = []  # prédiction return h+1
+                            mamba_returns_h3 = []  # prédiction return h+3
+                            mamba_returns_h6 = []  # prédiction return h+6
+
+                            # Utiliser les features complètes (pas filtrées par date)
+                            all_feat = selected_features if len(selected_features.columns) <= 40 else features
+
+                            for i in range(len(rl_features)):
+                                idx = rl_features.index[i]
+                                # Trouver la position dans all_feat
+                                pos = all_feat.index.get_loc(idx)
+                                if pos >= lookback_mamba:
+                                    window = all_feat.iloc[pos - lookback_mamba:pos]
+                                    pred = mamba_pred.predict(window, symbol.replace("/", ""))
+                                    mamba_directions.append(pred['direction'])
+                                    mamba_confidences.append(pred['confidence'])
+                                    pr = pred['predicted_returns']
+                                    mamba_returns_h1.append(pr[0] if len(pr) > 0 else 0.0)
+                                    mamba_returns_h3.append(pr[2] if len(pr) > 2 else 0.0)
+                                    mamba_returns_h6.append(pr[5] if len(pr) > 5 else 0.0)
+                                else:
+                                    mamba_directions.append(0)
+                                    mamba_confidences.append(0.0)
+                                    mamba_returns_h1.append(0.0)
+                                    mamba_returns_h3.append(0.0)
+                                    mamba_returns_h6.append(0.0)
+
+                            # Ajouter comme features
+                            rl_features = rl_features.copy()
+                            rl_features['mamba_direction'] = mamba_directions
+                            rl_features['mamba_confidence'] = mamba_confidences
+                            rl_features['mamba_return_h1'] = mamba_returns_h1
+                            rl_features['mamba_return_h3'] = mamba_returns_h3
+                            rl_features['mamba_return_h6'] = mamba_returns_h6
+                            logger.info(f"Mamba features ajoutées: 5 colonnes → {rl_features.shape[1]} features total")
+                        else:
+                            logger.warning("Mamba model non trouvé, RL sans prédictions Mamba")
+                    except Exception as e:
+                        logger.warning(f"Mamba predictions failed: {e}, RL sans prédictions Mamba")
+
                     rl.train(rl_features, rl_df)
                 except Exception as e:
                     logger.error(f"RL training failed : {e}")
