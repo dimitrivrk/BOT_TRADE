@@ -199,7 +199,7 @@ def run_train(args):
                     try:
                         from models.crypto_mamba import MambaPredictor
                         mamba_pred = MambaPredictor()
-                        mamba_pred.load(symbol.replace("/", ""))
+                        mamba_pred.load(symbol)  # même format que train() : "BTC/USDT"
 
                         if mamba_pred.model is not None:
                             logger.info("Génération des prédictions Mamba pour le RL...")
@@ -221,7 +221,7 @@ def run_train(args):
                                 pos = all_feat.index.get_loc(idx)
                                 if pos >= lookback_mamba:
                                     window = all_feat.iloc[pos - lookback_mamba:pos]
-                                    pred = mamba_pred.predict(window, symbol.replace("/", ""))
+                                    pred = mamba_pred.predict(window, symbol)
                                     mamba_directions.append(pred['direction'])
                                     mamba_confidences.append(pred['confidence'])
                                     pr = pred['predicted_returns']
