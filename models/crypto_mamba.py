@@ -1083,20 +1083,24 @@ class MambaPredictor:
                 num_branches=self.model_params.get('num_branches', 3),
             )
 
-            if load_from_ckpt:
-                # Lightning checkpoint : les poids sont sous "state_dict" avec prefix "model."
-                ckpt = torch.load(ckpt_path, map_location=self.device)
-                state_dict = ckpt.get('state_dict', ckpt)
-                # Retirer le prefix "model." si présent (Lightning wraps le modèle)
+            # Charger le fichier (peut être un state_dict pur ou un Lightning checkpoint)
+            load_path = ckpt_path if load_from_ckpt else str(model_path)
+            raw = torch.load(load_path, map_location=self.device)
+
+            # Détecter si c'est un Lightning checkpoint (contient "state_dict" comme clé)
+            if isinstance(raw, dict) and "state_dict" in raw:
+                state_dict = raw["state_dict"]
+                # Retirer le prefix "model." (Lightning wraps le modèle dans un Module)
                 clean_state = {}
                 for k, v in state_dict.items():
                     new_key = k.replace("model.", "", 1) if k.startswith("model.") else k
                     clean_state[new_key] = v
                 self.model.load_state_dict(clean_state, strict=False)
-                logger.info(f"Model loaded from Lightning checkpoint: {ckpt_path}")
+                logger.info(f"Model loaded from Lightning checkpoint: {load_path}")
             else:
-                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-                logger.info(f"Model loaded from {model_path}")
+                # State dict pur
+                self.model.load_state_dict(raw)
+                logger.info(f"Model loaded from {load_path}")
 
             self.model.to(self.device)
             self.model.eval()
