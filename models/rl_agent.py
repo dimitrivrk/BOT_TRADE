@@ -372,9 +372,10 @@ class CryptoTradingEnvDiscrete(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
-        # 3 actions discrètes : Short (-1), Hold (0), Long (+1)
-        self.action_space = spaces.Discrete(3)
-        self.ACTION_MAP = {0: -1.0, 1: 0.0, 2: 1.0}
+        # 5 actions discrètes avec positions fractionnelles (pas de full exposure)
+        # Ça évite de perdre 50% du capital en quelques steps
+        self.action_space = spaces.Discrete(5)
+        self.ACTION_MAP = {0: -0.5, 1: -0.2, 2: 0.0, 3: 0.2, 4: 0.5}
 
         self.reset()
 
@@ -986,7 +987,7 @@ class RLTradingAgent:
                 action, _ = model.predict(obs_2d, deterministic=deterministic)
 
                 # Convertir action discrète → direction (-1, 0, +1)
-                action_map = {0: -1, 1: 0, 2: 1}
+                action_map = {0: -1, 1: -1, 2: 0, 3: 1, 4: 1}  # 5 actions → direction
                 agent_predictions[algo_name] = action_map.get(int(action.flatten()[0]), 0)
 
             except Exception as e:
