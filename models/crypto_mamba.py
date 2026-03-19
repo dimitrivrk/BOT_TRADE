@@ -962,8 +962,14 @@ class MambaPredictor:
             }
 
         # Normalisation
-        features = features_df.values
-        features = self.scaler.transform(features)
+        features = features_df.values.astype(np.float64)
+        if self.scaler is not None:
+            features = self.scaler.transform(features)
+        else:
+            # Pas de scaler sauvé → normaliser à la volée (z-score sur la fenêtre)
+            mean = np.mean(features, axis=0)
+            std = np.std(features, axis=0) + 1e-8
+            features = (features - mean) / std
 
         # Conversion en tensor (prendre les dernières 168 séquences)
         lookback = self.model_params.get('lookback', 168)
