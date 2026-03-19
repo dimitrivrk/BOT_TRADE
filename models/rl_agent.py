@@ -653,21 +653,21 @@ class RLTradingAgent:
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
-                net_arch=[512, 256, 128],       # v5: plus profond (meilleure expressivité)
+                net_arch=[256, 128],             # SOTA: moins profond = moins d'overfit
                 activation_fn=nn.ReLU,
             )
             return SAC(
                 "MlpPolicy", env,
-                learning_rate=1e-4,              # v6: 1e-4 (3e-4 divergeait avec reward ×100)
+                learning_rate=1e-4,
                 buffer_size=int(self.cfg.get("buffer_size", 200_000)),
                 learning_starts=int(self.cfg.get("learning_starts", 2000)),
                 batch_size=256,
                 tau=float(self.cfg.get("tau", 0.005)),
-                gamma=0.99,                      # v6: 0.99 — avec reward simple le gamma peut être plus haut
+                gamma=0.99,
                 train_freq=1,
-                gradient_steps=1,                # v6: 1 suffit avec reward claire (pas besoin de compenser bruit)
-                ent_coef="auto",
-                target_entropy=-0.3,             # v6: garde exploration modérée (empêche entropy collapse)
+                gradient_steps=1,
+                ent_coef=0.1,                    # SOTA: FIXE à 0.1 — "auto" collapse TOUJOURS en trading
+                                                 # 0.1 = exploration modérée permanente, pas de collapse
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log="logs/tensorboard/rl",
@@ -679,8 +679,8 @@ class RLTradingAgent:
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
                 net_arch=dict(
-                    pi=[512, 256, 128],        # v5: policy plus large
-                    vf=[512, 256, 128],        # v5: value plus large
+                    pi=[256, 128],             # SOTA: moins profond = moins d'overfit
+                    vf=[256, 128],
                 ),
                 activation_fn=nn.ReLU,
             )
@@ -711,7 +711,7 @@ class RLTradingAgent:
             policy_kwargs = dict(
                 features_extractor_class=fe_class,
                 features_extractor_kwargs=fe_kwargs,
-                net_arch=[512, 256, 128],           # v5: plus profond
+                net_arch=[256, 128],                # SOTA: moins profond
                 activation_fn=nn.ReLU,
             )
             return DDPG(

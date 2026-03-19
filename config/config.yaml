@@ -147,11 +147,11 @@ models:
     buffer_size: 200000    # 200k (données récentes)
     learning_starts: 2000
     tau: 0.005
-    total_timesteps: 500000  # 500k steps par agent
+    total_timesteps: 150000  # SOTA: 150k (Sharpe stabilise à ~100k, au-delà = overfit)
     lookback: 48             # v5: 48 candles = 2 jours (plus de contexte)
     checkpoint_dir: "checkpoints/rl"
     n_envs: 24               # envs paralleles (SubprocVecEnv)
-    eval_freq: 2000          # eval toutes les ~48k timesteps
+    eval_freq: 500           # SOTA: eval fréquent (~12k steps) pour capturer le best model tôt
     n_eval_episodes: 3       # 3 episodes d'eval
     feature_extractor: "ssm" # ssm = Conv1D multi-scale + temporal attention
     env:
